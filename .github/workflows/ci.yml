@@ -1,0 +1,579 @@
+# CI workflow optimized for cost reduction (76% savings target)
+# - Fast path: docs only → lint+tsc (~1 min)
+# - Full path: code or migration changes → all tests (~2.5-3 min)
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main, production]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Phase 1: Detect what changed to determine fast vs full path
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      path: ${{ steps.changes.outputs.path }}
+      has_migrations: ${{ steps.changes.outputs.has_migrations }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          CHANGED=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          # Check for migration file changes
+          MIGRATION_CHANGED=$(echo "$CHANGED" | grep -E '^supabase/migrations/' || true)
+          if [ -n "$MIGRATION_CHANGED" ]; then
+            echo "has_migrations=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_migrations=false" >> $GITHUB_OUTPUT
+          fi
+          CODE_CHANGED=$(echo "$CHANGED" | grep -E '\.(ts|tsx|js|jsx|json|css)$' || true)
+          if [ -z "$CODE_CHANGED" ] && [ -z "$MIGRATION_CHANGED" ]; then
+            echo "path=fast" >> $GITHUB_OUTPUT
+            echo "::notice ::Fast path - no code changes detected"
+          elif [ -z "$CODE_CHANGED" ] && [ -n "$MIGRATION_CHANGED" ]; then
+            echo "path=full" >> $GITHUB_OUTPUT
+            echo "::notice ::Full path - migration changes require test validation"
+          else
+            # Classify changes as evolution-only, non-evolution-only, or full
+            EVOLUTION_ONLY_PATHS="evolution|arena|strategy-resolution|manual-experiment|src/app/admin/quality/optimization/"
+            SHARED_PATHS="package\\.json|tsconfig|next\\.config|playwright\\.config|jest\\.config|src/lib/|src/utils/|src/types/"
+
+            HAS_SHARED=$(echo "$CODE_CHANGED" | grep -E "$SHARED_PATHS" || true)
+            EVOLUTION_FILES=$(echo "$CODE_CHANGED" | grep -E "$EVOLUTION_ONLY_PATHS" || true)
+            NON_EVOLUTION_FILES=$(echo "$CODE_CHANGED" | grep -vE "$EVOLUTION_ONLY_PATHS" || true)
+
+            if [ -n "$HAS_SHARED" ]; then
+              echo "path=full" >> $GITHUB_OUTPUT
+              echo "::notice ::Full path - shared code changes detected"
+            elif [ -n "$EVOLUTION_FILES" ] && [ -z "$NON_EVOLUTION_FILES" ]; then
+              echo "path=evolution-only" >> $GITHUB_OUTPUT
+              echo "::notice ::Evolution-only path - only evolution code changed"
+            elif [ -z "$EVOLUTION_FILES" ] && [ -n "$NON_EVOLUTION_FILES" ]; then
+              echo "path=non-evolution-only" >> $GITHUB_OUTPUT
+              echo "::notice ::Non-evolution-only path - no evolution code changed"
+            else
+              echo "path=full" >> $GITHUB_OUTPUT
+              echo "::notice ::Full path - mixed code changes detected"
+            fi
+          fi
+
+  # Apply PR migrations to staging so CI tests run against the correct schema
+  deploy-migrations:
+    name: Deploy Migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [detect-changes]
+    if: >-
+      needs.detect-changes.outputs.has_migrations == 'true'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
+    concurrency:
+      group: migration-staging
+      cancel-in-progress: false
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: supabase/setup-cli@v1
+      - name: Check for destructive DDL (PR-changed migrations only)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          CHANGED=$(git diff --name-only --diff-filter=AM "origin/${BASE_REF}...HEAD" -- supabase/migrations/)
+          if [ -z "$CHANGED" ]; then exit 0; fi
+          # Allowlist: DROP FUNCTION/VIEW/INDEX/TRIGGER IF EXISTS (standard RPC/view replacement)
+          # Block: DROP TABLE, DROP COLUMN, RENAME TABLE/COLUMN, TRUNCATE, DELETE FROM
+          BLOCKED=$(echo "$CHANGED" | xargs grep -niE '(DROP\s+(TABLE|COLUMN)|RENAME\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM)' \
+            2>/dev/null | grep -viE 'DROP\s+(FUNCTION|VIEW|INDEX|TRIGGER)\s+IF\s+EXISTS' || true)
+          if [ -n "$BLOCKED" ]; then
+            echo "::error::Destructive DDL detected — requires manual approval:"
+            echo "$BLOCKED"
+            exit 1
+          fi
+      - name: Link to staging project
+        run: supabase link --project-ref ifubinffdbyewoezcidz
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      - name: Repair remote-only migration history
+        # When staging's supabase_migrations table has rows that don't exist as local
+        # files (e.g. CI auto-renamed timestamps on a previous run, or a hotfix was
+        # applied directly), `supabase db push` aborts with "Remote migration versions
+        # not found in local migrations directory". Mark each remote-only version as
+        # reverted so the push can proceed. The actual schema rows aren't dropped —
+        # we're only repairing the migration ledger entry. Ported from the
+        # deploy/main-to-production-mar29 branch where this pattern was first used.
+        run: |
+          REMOTE=$(supabase migration list 2>/dev/null \
+            | grep -oE '[0-9]{14}' | sort -u || true)
+          LOCAL=$(ls supabase/migrations/*.sql 2>/dev/null \
+            | grep -oE '[0-9]{14}' | sort -u || true)
+          REMOTE_ONLY=$(comm -23 <(echo "$REMOTE") <(echo "$LOCAL"))
+          if [ -z "$REMOTE_ONLY" ]; then
+            echo "No remote-only migrations to repair"
+            exit 0
+          fi
+          for ver in $REMOTE_ONLY; do
+            echo "Repairing remote-only migration: $ver"
+            supabase migration repair --status reverted "$ver" || true
+          done
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      - name: Apply migrations to staging
+        run: supabase db push --include-all
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+
+  # Regenerate types from staging DB after migrations (or latest schema if no migrations)
+  generate-types:
+    name: Generate Types
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [detect-changes, deploy-migrations]
+    if: >-
+      !failure() && !cancelled()
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: supabase/setup-cli@v1
+      - name: Generate types
+        id: gen
+        continue-on-error: true
+        run: npx supabase gen types --lang typescript --project-id ${{ vars.SUPABASE_STAGING_PROJECT_ID }} > src/lib/database.types.ts.tmp
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      - name: Validate and apply types file
+        if: steps.gen.outcome == 'success'
+        run: |
+          if [ ! -s src/lib/database.types.ts.tmp ]; then
+            echo "::error::Type generation produced empty file"
+            exit 1
+          fi
+          mv src/lib/database.types.ts.tmp src/lib/database.types.ts
+      - name: Commit if changed
+        run: |
+          if ! git diff --quiet src/lib/database.types.ts; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add src/lib/database.types.ts
+            git commit -m "chore: regenerate database types"
+            git push
+          fi
+
+  # Always run: lint and typecheck (even on docs-only PRs)
+  typecheck:
+    name: TypeScript Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [detect-changes, generate-types]
+    if: '!cancelled()'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Cache tsc incremental build
+        uses: actions/cache@v4
+        with:
+          path: tsconfig.ci.tsbuildinfo
+          key: tsc-cache-${{ runner.os }}-${{ hashFiles('tsconfig.ci.json', 'package-lock.json') }}
+
+      # SYNC-POINT: Uses npm run typecheck (same as finalize.md Step 4)
+      # tsconfig.ci.json has incremental:true + tsBuildInfoFile — no CLI flags needed
+      - run: npm run typecheck
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [detect-changes]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+
+  # Phase 2: Affected-only unit tests (skip on fast path)
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [detect-changes, typecheck, lint]
+    if: >-
+      !cancelled() && !failure()
+      && needs.detect-changes.outputs.path != 'fast'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Cache Jest transforms
+        uses: actions/cache@v4
+        with:
+          path: /tmp/jest-cache
+          key: jest-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: jest-cache-${{ runner.os }}-
+
+      - name: Run Unit Tests (affected only)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: npm run test:ci -- --changedSince="origin/${BASE_REF}" --cacheDirectory=/tmp/jest-cache
+      - run: npm run test:esm
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-coverage
+          path: coverage/
+          retention-days: 7
+
+  # Phase 3: Critical integration tests for PRs to main
+  integration-critical:
+    name: Integration Tests (Critical)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [detect-changes, unit-tests]
+    if: >-
+      !cancelled() && !failure()
+      && needs.detect-changes.outputs.path != 'fast' && github.base_ref == 'main'
+    environment: staging
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME_ALL: ${{ secrets.PINECONE_INDEX_NAME_ALL }}
+      PINECONE_NAMESPACE: ${{ secrets.PINECONE_NAMESPACE }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:integration:critical
+
+  # Evolution integration tests for PRs to production
+  integration-evolution:
+    name: Integration Tests (Evolution)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [detect-changes, unit-tests]
+    if: >-
+      !cancelled() && !failure()
+      && (github.base_ref == 'production' || github.base_ref == 'main') &&
+      (needs.detect-changes.outputs.path == 'evolution-only' || needs.detect-changes.outputs.path == 'full')
+    environment: staging
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME_ALL: ${{ secrets.PINECONE_INDEX_NAME_ALL }}
+      PINECONE_NAMESPACE: ${{ secrets.PINECONE_NAMESPACE }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:integration:evolution
+
+  # Non-evolution integration tests for PRs to production
+  integration-non-evolution:
+    name: Integration Tests (Non-Evolution)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [detect-changes, unit-tests]
+    if: >-
+      !cancelled() && !failure()
+      && github.base_ref == 'production' &&
+      (needs.detect-changes.outputs.path == 'non-evolution-only' || needs.detect-changes.outputs.path == 'full')
+    environment: staging
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME_ALL: ${{ secrets.PINECONE_INDEX_NAME_ALL }}
+      PINECONE_NAMESPACE: ${{ secrets.PINECONE_NAMESPACE }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:integration:non-evolution
+
+  # Phase 5: E2E critical runs parallel with integration (both depend on unit-tests)
+  e2e-critical:
+    name: E2E Tests (Critical)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [detect-changes, unit-tests]
+    if: >-
+      !cancelled() && !failure()
+      && needs.detect-changes.outputs.path != 'fast' && github.base_ref == 'main'
+    environment: staging
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME_ALL: ${{ secrets.PINECONE_INDEX_NAME_ALL }}
+      PINECONE_NAMESPACE: ${{ secrets.PINECONE_NAMESPACE }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+      TEST_USER_ID: ${{ secrets.TEST_USER_ID }}
+      NEXT_PUBLIC_USE_AI_API_ROUTE: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: nextjs-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: nextjs-cache-${{ runner.os }}-
+
+      - name: Seed admin test user
+        run: npx tsx scripts/seed-admin-test-user.ts
+
+      - name: Get Playwright version
+        id: playwright-version
+        run: echo "version=$(npm ls @playwright/test --json | jq -r '.dependencies["@playwright/test"].version')" >> $GITHUB_OUTPUT
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright deps (if cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Run Critical E2E Tests
+        run: npm run test:e2e:critical
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-critical
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  # Evolution E2E tests for PRs to production (single shard — small test set)
+  e2e-evolution:
+    name: E2E Tests (Evolution)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [detect-changes, unit-tests]
+    if: >-
+      !cancelled() && !failure()
+      && (github.base_ref == 'production' || github.base_ref == 'main') &&
+      (needs.detect-changes.outputs.path == 'evolution-only' || needs.detect-changes.outputs.path == 'full')
+    environment: staging
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME_ALL: ${{ secrets.PINECONE_INDEX_NAME_ALL }}
+      PINECONE_NAMESPACE: ${{ secrets.PINECONE_NAMESPACE }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+      TEST_USER_ID: ${{ secrets.TEST_USER_ID }}
+      NEXT_PUBLIC_USE_AI_API_ROUTE: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: nextjs-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: nextjs-cache-${{ runner.os }}-
+
+      - name: Seed admin test user
+        run: npx tsx scripts/seed-admin-test-user.ts
+
+      - name: Get Playwright version
+        id: playwright-version
+        run: echo "version=$(npm ls @playwright/test --json | jq -r '.dependencies["@playwright/test"].version')" >> $GITHUB_OUTPUT
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright deps (if cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Run Evolution E2E Tests
+        run: npm run test:e2e:evolution
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-evolution
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  # Non-evolution E2E tests for PRs to production (sharded for speed)
+  e2e-non-evolution:
+    name: E2E Tests (Non-Evolution - Shard ${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [detect-changes, unit-tests]
+    if: >-
+      !cancelled() && !failure()
+      && github.base_ref == 'production' &&
+      (needs.detect-changes.outputs.path == 'non-evolution-only' || needs.detect-changes.outputs.path == 'full')
+    environment: staging
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME_ALL: ${{ secrets.PINECONE_INDEX_NAME_ALL }}
+      PINECONE_NAMESPACE: ${{ secrets.PINECONE_NAMESPACE }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+      TEST_USER_ID: ${{ secrets.TEST_USER_ID }}
+      NEXT_PUBLIC_USE_AI_API_ROUTE: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: nextjs-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: nextjs-cache-${{ runner.os }}-
+
+      - name: Seed admin test user
+        run: npx tsx scripts/seed-admin-test-user.ts
+
+      - name: Get Playwright version
+        id: playwright-version
+        run: echo "version=$(npm ls @playwright/test --json | jq -r '.dependencies["@playwright/test"].version')" >> $GITHUB_OUTPUT
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright deps (if cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Run Non-Evolution E2E Tests
+        run: npm run test:e2e:non-evolution -- --shard=${{ matrix.shard }}/3
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-non-evolution-${{ matrix.shard }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7

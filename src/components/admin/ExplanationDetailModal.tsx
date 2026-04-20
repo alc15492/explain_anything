@@ -1,0 +1,210 @@
+'use client';
+/**
+ * Modal for viewing and managing a single explanation in the admin dashboard.
+ * Shows full content and provides hide/restore actions with accessibility support.
+ */
+
+import { useState, useId } from 'react';
+import FocusTrap from 'focus-trap-react';
+import { toast } from 'sonner';
+import {
+  hideExplanationAction,
+  restoreExplanationAction,
+  type AdminExplanation
+} from '@/lib/services/adminContent';
+import { ConfirmDialog } from '@evolution/components/evolution/dialogs/ConfirmDialog';
+
+interface ExplanationDetailModalProps {
+  explanation: AdminExplanation;
+  onClose: () => void;
+  onUpdate: () => void;
+}
+
+export function ExplanationDetailModal({
+  explanation,
+  onClose,
+  onUpdate
+}: ExplanationDetailModalProps) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const titleId = useId();
+  const [confirmAction, setConfirmAction] = useState<'hide' | 'restore' | null>(null);
+
+  const executeAction = async () => {
+    const action = confirmAction;
+    setConfirmAction(null);
+    if (!action) return;
+
+    setLoading(true);
+    setError(null);
+    const result = action === 'hide'
+      ? await hideExplanationAction(explanation.id)
+      : await restoreExplanationAction(explanation.id);
+    if (result.success) {
+      toast.success(`Explanation ${action === 'hide' ? 'hidden' : 'restored'} successfully`);
+      onUpdate();
+      onClose();
+    } else {
+      setError(result.error?.message || `Failed to ${action} explanation`);
+    }
+    setLoading(false);
+  };
+
+  const handleHide = () => setConfirmAction('hide');
+  const handleRestore = () => setConfirmAction('restore');
+
+  return (
+    <>
+    <FocusTrap focusTrapOptions={{ allowOutsideClick: true }}>
+      <div
+        className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        data-testid="admin-content-detail-modal"
+      >
+        <div className="bg-[var(--surface-secondary)] rounded-lg shadow-warm-xl max-w-4xl w-full max-h-[90vh] flex flex-col">
+          {/* Header */}
+          <div className="flex justify-between items-start p-4 border-b border-[var(--border-default)]">
+            <div>
+              <h2 id={titleId} className="text-xl font-semibold text-[var(--text-primary)]">
+                {explanation.explanation_title || 'Untitled'}
+              </h2>
+            <div className="flex gap-3 mt-1 text-sm text-[var(--text-muted)]">
+              <span>ID: {explanation.id}</span>
+              <span>Status: {explanation.status}</span>
+              {explanation.delete_status !== 'visible' && (
+                <span className="text-red-400 capitalize">{explanation.delete_status}</span>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            data-testid="admin-content-detail-close"
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-2xl leading-none"
+            aria-label="Close modal"
+          >
+            &times;
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto p-4">
+          {error && (
+            <div className="mb-4 p-3 bg-red-900/20 border border-red-600 rounded-md text-red-400">
+              {error}
+            </div>
+          )}
+
+          {/* Metadata */}
+          <div className="grid grid-cols-2 gap-4 mb-6 text-sm">
+            <div>
+              <span className="text-[var(--text-muted)]">Created:</span>{' '}
+              <span className="text-[var(--text-primary)]">
+                {new Date(explanation.timestamp).toLocaleString()}
+              </span>
+            </div>
+            <div>
+              <span className="text-[var(--text-muted)]">Primary Topic ID:</span>{' '}
+              <span className="text-[var(--text-primary)]">
+                {explanation.primary_topic_id || 'None'}
+              </span>
+            </div>
+            {explanation.delete_status !== 'visible' && explanation.delete_status_changed_at && (
+              <>
+                <div>
+                  <span className="text-[var(--text-muted)]">Status Changed:</span>{' '}
+                  <span className="text-red-400">
+                    {new Date(explanation.delete_status_changed_at).toLocaleString()}
+                  </span>
+                </div>
+                {explanation.delete_reason && (
+                  <div>
+                    <span className="text-[var(--text-muted)]">Reason:</span>{' '}
+                    <span className="text-[var(--text-primary)]">
+                      {explanation.delete_reason}
+                    </span>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* Summary */}
+          {explanation.summary_teaser && (
+            <div className="mb-4">
+              <h3 className="text-sm font-semibold text-[var(--text-muted)] mb-1">Summary</h3>
+              <p className="text-[var(--text-secondary)] text-sm">
+                {explanation.summary_teaser}
+              </p>
+            </div>
+          )}
+
+          {/* Content preview */}
+          <div>
+            <h3 className="text-sm font-semibold text-[var(--text-muted)] mb-2">Content</h3>
+            <div className="bg-[var(--surface-elevated)] rounded-lg p-4 max-h-96 overflow-y-auto">
+              <pre className="whitespace-pre-wrap text-sm text-[var(--text-primary)] font-mono">
+                {explanation.content}
+              </pre>
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex justify-between items-center p-4 border-t border-[var(--border-default)]">
+          <a
+            href={`/explanations?id=${explanation.id}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-testid="admin-content-detail-view-public"
+            className="text-[var(--accent-gold)] hover:underline text-sm"
+          >
+            View Public Page →
+          </a>
+          <div className="flex gap-3">
+            <button
+              onClick={onClose}
+              data-testid="admin-content-detail-close-footer"
+              className="px-4 py-2 border border-[var(--border-default)] rounded-md hover:bg-[var(--surface-elevated)]"
+            >
+              Close
+            </button>
+            {explanation.delete_status !== 'visible' ? (
+              <button
+                onClick={handleRestore}
+                disabled={loading}
+                data-testid="admin-content-detail-restore"
+                className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50"
+              >
+                {loading ? 'Restoring...' : 'Restore'}
+              </button>
+            ) : (
+              <button
+                onClick={handleHide}
+                disabled={loading}
+                data-testid="admin-content-detail-hide"
+                className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 disabled:opacity-50"
+              >
+                {loading ? 'Hiding...' : 'Hide'}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      </div>
+    </FocusTrap>
+    <ConfirmDialog
+      open={!!confirmAction}
+      onClose={() => setConfirmAction(null)}
+      title={confirmAction === 'hide' ? 'Hide Explanation?' : 'Restore Explanation?'}
+      message={confirmAction === 'hide'
+        ? 'This will hide the explanation from public view.'
+        : 'This will restore the explanation to public view.'}
+      confirmLabel={confirmAction === 'hide' ? 'Hide' : 'Restore'}
+      onConfirm={executeAction}
+      danger={confirmAction === 'hide'}
+    />
+    </>
+  );
+}

@@ -1,0 +1,196 @@
+name: Post-Deploy Smoke Tests
+
+# Triggers when Vercel completes a deployment
+on:
+  deployment_status:
+
+jobs:
+  smoke-test:
+    # Use Production environment to access PROD_TEST_USER_* secrets
+    environment: Production
+    timeout-minutes: 15
+    # Only run on successful Vercel deployments to production
+    # Filter out GitHub Actions environment deployments (which have GitHub URLs as target_url)
+    if: |
+      github.event.deployment_status.state == 'success' &&
+      github.event.deployment.environment == 'Production' &&
+      contains(github.event.deployment_status.target_url, 'vercel.app')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Wait for deployment to stabilize
+        run: sleep 10
+
+      - name: Health Check
+        id: health
+        env:
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: |
+          DEPLOY_URL="${{ github.event.deployment_status.target_url }}"
+          echo "Checking health at: $DEPLOY_URL/api/health"
+
+          # Add bypass header for protected deployments
+          # Use -L to follow redirects (Vercel returns 307 with Set-Cookie, then redirects)
+          # Use -c/-b to handle cookies across redirects
+          # Use --max-redirs to prevent infinite redirect loops
+          # Use --connect-timeout and --max-time to prevent hangs
+          if [ -n "$VERCEL_AUTOMATION_BYPASS_SECRET" ]; then
+            http_code=$(curl -s -L --max-redirs 5 --connect-timeout 10 --max-time 30 \
+              -o /tmp/health.json -w '%{http_code}' \
+              -c /tmp/cookies.txt -b /tmp/cookies.txt \
+              -H "x-vercel-protection-bypass: $VERCEL_AUTOMATION_BYPASS_SECRET" \
+              -H "x-vercel-set-bypass-cookie: samesitenone" \
+              "$DEPLOY_URL/api/health")
+          else
+            http_code=$(curl -s -L --max-redirs 5 --connect-timeout 10 --max-time 30 \
+              -o /tmp/health.json -w '%{http_code}' "$DEPLOY_URL/api/health")
+          fi
+
+          # Handle all non-200 status codes (use = for POSIX compliance)
+          if [ "$http_code" = "403" ]; then
+            echo "::error::Deployment protection blocked request (403). Check VERCEL_AUTOMATION_BYPASS_SECRET."
+            exit 1
+          elif [ "$http_code" != "200" ]; then
+            echo "::error::Health check returned HTTP $http_code"
+            cat /tmp/health.json 2>/dev/null || echo "(No response body)"
+            exit 1
+          fi
+
+          # Add jq error handling
+          response=$(cat /tmp/health.json)
+          if ! status=$(echo "$response" | jq -r '.status' 2>/dev/null); then
+            echo "::error::Failed to parse health check JSON response"
+            echo "Response body:"
+            cat /tmp/health.json
+            exit 1
+          fi
+
+          echo "Health check response:"
+          echo "$response" | jq .
+
+          if [ "$status" != "healthy" ]; then
+            echo "::error::Health check failed - status: $status"
+
+            # Extract specific failures for better error messages
+            db_status=$(echo "$response" | jq -r '.checks.database.status')
+            tags_status=$(echo "$response" | jq -r '.checks.requiredTags.status')
+            env_status=$(echo "$response" | jq -r '.checks.environment.status')
+
+            if [ "$db_status" = "fail" ]; then
+              echo "::error::Database check failed: $(echo "$response" | jq -r '.checks.database.message')"
+            fi
+            if [ "$tags_status" = "fail" ]; then
+              echo "::error::Required tags check failed: $(echo "$response" | jq -r '.checks.requiredTags.message')"
+            fi
+            if [ "$env_status" = "fail" ]; then
+              echo "::error::Environment check failed: $(echo "$response" | jq -r '.checks.environment.message')"
+            fi
+
+            exit 1
+          fi
+
+          echo "::notice::Health check passed!"
+
+      - name: Get Playwright version
+        id: playwright-version
+        run: echo "version=$(npm ls @playwright/test --json | jq -r '.dependencies["@playwright/test"].version')" >> $GITHUB_OUTPUT
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright deps (if cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Run Smoke Tests against Production
+        env:
+          # Override base URL to point to production deployment
+          BASE_URL: ${{ github.event.deployment_status.target_url }}
+          # Production test credentials (from Production environment)
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+          TEST_USER_ID: ${{ secrets.TEST_USER_ID }}
+          # Vercel bypass for protected deployments
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          # Supabase env vars for auth fixture and production safety validation
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          echo "Running smoke tests against: $BASE_URL"
+          npx playwright test --project=chromium --grep="@smoke" --reporter=list
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-test-results
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          echo "::error::Post-deployment smoke tests failed! Check the deployment at ${{ github.event.deployment_status.target_url }}"
+
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data '{
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "🚨 Production Smoke Tests Failed",
+                      "emoji": true
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Environment:*\nProduction"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Deployment:*\n<${{ github.event.deployment_status.target_url }}|View Site>"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Actions Run:*\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>"
+                    }
+                  }
+                ]
+              }' \
+              "$SLACK_WEBHOOK_URL"
+          else
+            echo "::warning::SLACK_WEBHOOK_URL not configured - skipping Slack notification"
+          fi

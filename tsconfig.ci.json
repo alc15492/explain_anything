@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": true,
+    "tsBuildInfoFile": "tsconfig.ci.tsbuildinfo"
+  },
+  "include": ["next-env.d.ts", "src/**/*.ts", "src/**/*.tsx", "evolution/src/**/*.ts", "evolution/src/**/*.tsx", "evolution/scripts/*.ts", "evolution/scripts/lib/**/*.ts", "scripts/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    ".next",
+    "evolution/scripts/deferred/**"
+  ]
+}

@@ -1,0 +1,324 @@
+/**
+ * Creates an explanation prompt by combining the base prompt template with user input
+ * 
+ * @param title - The topic or subject to be explained
+ * @returns A formatted prompt string
+ */
+export function createExplanationPrompt(title: string, additionalRules: string[]): string {
+    const basePrompt = `Write a clear, concise explanation of the topic below using modular paragraphs of 5-10 sentences each.
+
+Title: ${title}
+
+Rules:
+- Output the content only, the title has already been provided
+- Always format using Markdown. Content should not include anything larger than section headers (##)
+- Each section should have a section header beginning with ##
+- Highlight a few key terms in every paragraph using bold formatting **keyterm**. As an example, consider this sentence: Tom Brady was the **quarterback** who won **Super Bowl LV**. 
+- For inline math using single dollars: $\frac{2}{5}$, for block math use double dollars 
+$$(expession)$$
+- Use lists and bullets sparingly${additionalRules.length > 0 ? '\n' + additionalRules.map(rule => `- ${rule}`).join('\n') : ''}
+
+
+`;
+
+    return basePrompt;
+} 
+
+/**
+ * Creates a title prompt for generating article titles based on a user-supplied topic
+ *
+ * - Inserts the user topic under the Topic section, replacing the default question
+ * - Returns a formatted prompt string with title rules and principles
+ * - Used for generating title suggestions for a given topic
+ * - Does not call any other functions
+ * - Can be used by UI or backend to generate title prompts for LLMs
+ */
+export function createTitlePrompt(userInput: string): string {
+    return [
+        '### Prompt',
+        '',
+        '**Topic:**',
+        '',
+        `> *${userInput}*`,
+        '',
+        '**Task:**',
+        'Guess the title for the encyclopedia article that would directly answer the user query above.',
+        'Follow rules and principles below',
+        '',
+        '---',
+        '',
+        '### Title Rules',
+        '',
+        '1. Come up with a Wikipedia article title that could cover the prompt',
+        '2. Prioritize the most concise title possible that clearly covers the prompt',
+        //'1. Make sure we focus only on the most important topic, not subtopics',
+        //'2. Use only nouns and prepositions. No adjectives, verbs, adverbs, conjunctions, or other parts of speech.',
+        //'3. Make sure to use prepositions where appropriate',
+        //'4. Start with the most important terms. Prioritize core concepts (e.g., “Quantum Computers” before “Construction”).',
+        '',
+        '---',
+        '',
+        '### Additional Principles',
+        '',
+        '| Principle        | Description                                               | Example                                                   |',
+        '| ---------------- | --------------------------------------------------------- | --------------------------------------------------------- |',
+        '| **Recognizable** | Instantly clear what the article is about                 | “United States” instead of “USA (nation‑state)”           |',
+        '| **Natural**      | Use wording common in reliable sources, not forced syntax | “Barack Obama” rather than “Obama, Barack”                |',
+        '| **Concise**      | Shorter is better, as long as it\'s clear                  | “World War II" instead of "The Second World War Conflict" |',
+        '| **Precise**      | Specific enough to avoid confusion with similar topics    | "Mercury (element)" vs. "Mercury (planet)"                |',
+        '| **Consistent**   | Matches naming patterns in the same topic area            | Use established Wikipedia or academic naming styles       |',
+        '',
+        '---',
+        '',
+    ].join('\n');
+}
+
+//- Use lists and bullet points where necessary
+
+/**
+ * Creates a prompt for generating multiple standalone subsection titles from multiple headings
+ * 
+ * • Takes article title and array of subsection titles as input
+ * • Generates structured instructions for creating Wikipedia-style standalone titles
+ * • Specifies output format as JSON array for structured response processing
+ * • Instructs AI to create concise, descriptive titles that make sense without context
+ * • Used with callLLM to batch process multiple headings efficiently
+ * 
+ * Used by: enhanceContentWithHeadingLinks for batch processing multiple headings
+ * Calls: none (returns prompt string for LLM processing)
+ */
+export function createStandaloneTitlePrompt(
+  articleTitle: string,
+  subsectionTitles: string[]
+): string {
+  const titlesText = subsectionTitles.map((title, index) => `${index + 1}. "${title}"`).join('\n');
+  
+  return `You are tasked with creating Wikipedia-style standalone titles for multiple subsections.
+
+Original Article Title: "${articleTitle}"
+
+Original Subsection Titles:
+${titlesText}
+
+For each subsection title, create a concise, descriptive standalone title (2-6 words) that:
+1. Makes complete sense without reading the original article
+2. Follows Wikipedia title conventions (proper capitalization, clear and specific)
+3. Captures the essence of what this subsection covers
+4. Combines context from the article title with the subsection content
+5. Is searchable and discoverable on its own
+
+Return your response as a JSON object with a "titles" array containing the standalone titles in the same order as the input titles.
+
+Example format:
+{
+  "titles": [
+    "Machine Learning Model Training",
+    "Neural Network Architecture",
+    "Deep Learning Applications"
+  ]
+}`;
+}
+
+/**
+ * Creates a prompt for LLM to extract link candidates from article content
+ *
+ * • Takes article content and title as input
+ * • Instructs LLM to identify 5-15 educational terms
+ * • Criteria: standalone-worthy, not too generic, not the main topic
+ * • Forces structured JSON response
+ * • Used by extractLinkCandidates in returnExplanation for candidate generation
+ *
+ * @param content - The article content to analyze
+ * @param articleTitle - The title of the article (to exclude from candidates)
+ * @returns A formatted prompt string for LLM processing
+ */
+export function createLinkCandidatesPrompt(content: string, articleTitle: string): string {
+  return `Analyze the following encyclopedia article and identify 5-15 terms that would make good encyclopedia links.
+
+Article Title: "${articleTitle}"
+
+Article Content:
+${content}
+
+Select terms that:
+1. Are educational concepts readers might want to learn more about
+2. Could be standalone encyclopedia articles themselves
+3. Are specific enough (avoid generic words like "example", "process", "system", "method")
+4. Are NOT the article's main topic ("${articleTitle}" or close variants)
+5. Appear in the article content
+
+Return your response as a JSON object with a "candidates" array containing the terms.
+
+Example format:
+{
+  "candidates": [
+    "quantum entanglement",
+    "photon",
+    "wave function",
+    "Heisenberg uncertainty principle"
+  ]
+}`;
+}
+
+/**
+ * Creates a prompt for LLM to select the best match from a list of potential sources
+ * 
+ * • Takes user query and formatted matches as input
+ * • Generates instructions for LLM to select most relevant source
+ * • Forces single integer response (0-5) for structured processing
+ * • Returns 0 if no good match is found
+ * • Used by findBestMatchFromList service for intelligent match selection
+ * 
+ * @param userQuery - The original user query to match against
+ * @param formattedMatches - Pre-formatted numbered list of potential matches
+ * @returns A formatted prompt string for LLM processing
+ */
+export function createMatchSelectionPrompt(userQuery: string, formattedMatches: string): string {
+  return `
+User Query: "${userQuery}"
+
+Below are the top 5 potential sources that might answer this query:
+
+${formattedMatches}
+
+Based on the user query, which ONE source (numbered 1-5) exactly matches the user query described above. 
+Choose only the number of the most relevant source. If there is no match, then answer with 0.
+
+Your response must be a single integer between 0 and 5.
+`;
+}
+
+/**
+ * Creates a prompt for LLM to evaluate explanation tags
+ * 
+ * • Takes explanation title and content as input
+ * • Evaluates difficulty level (1-3), content length (4-6), and simple tags
+ * • Forces structured JSON response for multiple tag assessments
+ * • Evaluates based on content characteristics and teaching methods used
+ * • Used by tagEvaluation service for comprehensive tag assessment
+ * 
+ * @param explanationTitle - The title of the explanation to evaluate
+ * @param explanationContent - The full content of the explanation to evaluate
+ * @returns A formatted prompt string for LLM processing
+ */
+export function createTagEvaluationPrompt(explanationTitle: string, explanationContent: string): string {
+  return `
+Please evaluate the following explanation for multiple tag categories:
+
+Title: "${explanationTitle}"
+
+Content: "${explanationContent}"
+
+Evaluate the following aspects:
+
+1. DIFFICULTY LEVEL (1-3):
+- BEGINNER (1): Basic concepts, minimal prerequisites, simple language, introductory material
+- NORMAL (2): Moderate complexity, some background knowledge helpful, standard terminology
+- EXPERT (3): Advanced concepts, significant prerequisites, technical language, specialized knowledge required
+
+2. CONTENT LENGTH (4-6):
+- SHORT (4): Brief overview, key points only, under 500 words
+- MEDIUM (5): Standard explanation, balanced detail, 500-1500 words
+- LONG (6): Comprehensive coverage, extensive detail, over 1500 words
+
+3. SIMPLE TAGS (array of tag IDs, or null):
+Evaluate if the content contains these characteristics:
+- has_example (7): Contains practical examples or case studies
+- sequential (8): Presents information in step-by-step order
+- has_metaphor (9): Uses analogies, metaphors, or comparisons
+- instructional (10): Provides how-to instructions or procedures
+
+Return your response as a JSON object with:
+- difficultyLevel: integer (1-3)
+- length: integer (4-6)
+- simpleTags: array of integers (tag IDs) or null if none apply. Values here start at 7.
+
+Example: {"difficultyLevel": 2, "length": 5, "simpleTags": [7, 8]}
+`;
+}
+
+/**
+ * Creates a prompt for generating explanations with source citations
+ *
+ * • Takes user query and array of source content
+ * • Instructs LLM to use [n] notation for inline citations
+ * • Distinguishes between verbatim and summarized source content
+ * • Used by returnExplanationLogic when sources are provided
+ *
+ * @param title - The topic/title to explain
+ * @param sources - Array of source data with index, title, domain, content, isVerbatim
+ * @param additionalRules - Additional rules for content generation
+ * @returns A formatted prompt string for LLM processing
+ */
+export function createExplanationWithSourcesPrompt(
+  title: string,
+  sources: Array<{
+    index: number;
+    title: string;
+    domain: string;
+    content: string;
+    isVerbatim: boolean;
+  }>,
+  additionalRules: string[]
+): string {
+  const sourcesSection = sources.map(source => {
+    const sourceType = source.isVerbatim ? 'VERBATIM' : 'SUMMARIZED';
+    return `[Source ${source.index}] ${source.title} (${source.domain}) [${sourceType}]
+---
+${source.content}
+---`;
+  }).join('\n\n');
+
+  return `Write a clear, concise explanation of the topic below using modular paragraphs of 5-10 sentences each.
+Ground your explanation in the provided sources and cite them using [n] notation.
+
+Title: ${title}
+
+## Sources
+${sourcesSection}
+
+## Rules
+- Output the content only, the title has already been provided
+- Always format using Markdown. Content should not include anything larger than section headers (##)
+- Each section should have a section header beginning with ##
+- Highlight a few key terms in every paragraph using bold formatting **keyterm**
+- For inline math using single dollars: $\\frac{2}{5}$, for block math use double dollars
+- Use lists and bullets sparingly
+- IMPORTANT: Cite sources inline using [n] notation where n is the source number (e.g., [1], [2])
+- CITATION PLACEMENT: Place citations immediately after KEY FACTUAL CLAIMS, not entire sentences:
+  - Cite specific facts: dates, numbers, names, locations, statistics
+  - Cite technical terms when introducing sourced definitions
+  - Example: "Einstein developed **relativity** [2] in **1905** [1], fundamentally changing physics."
+  - NOT: "Einstein developed relativity in 1905, fundamentally changing physics. [1][2]"
+- Do NOT cite common knowledge or widely accepted facts that don't require verification
+- Do NOT cite every clause - only cite specific, verifiable claims that come from the sources
+- Prefer direct information from VERBATIM sources; use SUMMARIZED sources for supporting context
+- You may synthesize information across multiple sources, citing each source where its information is used
+- If sources conflict, note the discrepancy inline and cite both: "Source A claims X [1], while Source B states Y [2]"${additionalRules.length > 0 ? '\n' + additionalRules.map(rule => `- ${rule}`).join('\n') : ''}
+
+`;
+}
+
+export function editExplanationPrompt(userInput: string, additionalRules: string[], existingContent: string): string {
+    const basePrompt = `You are editing an existing explanation. Please lightly modify the content below based on the topic and rules provided.
+
+Output format:
+- Title and content
+
+Rules:
+- Always format using Markdown. Content should not include anything larger than section headers (##)
+- Highlight a few key terms in every paragraph using bold formatting **keyterm**. As an example, consider this sentence: Tom Brady was the **quarterback** who won **Super Bowl LV**. 
+- For inline math using single dollars: $\frac{2}{5}$, for block math use double dollars 
+$$(expession)$$
+- Use lists and bullets sparingly${additionalRules.length > 0 ? '\n' + additionalRules.map(rule => `- ${rule}`).join('\n') : ''}
+- Make only necessary changes to improve clarity, accuracy, or adherence to the rules
+- Preserve the overall structure and flow of the existing content
+- Only modify sections that need improvement based on the rules above
+
+Topic: ${userInput}
+
+Existing Content:
+${existingContent}`;
+
+    return basePrompt;
+}

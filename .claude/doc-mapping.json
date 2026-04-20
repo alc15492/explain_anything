@@ -1,0 +1,397 @@
+{
+  "version": "1.0",
+  "description": "Maps code file patterns to documentation files for automatic updates during /finalize",
+  "mappings": [
+    {
+      "pattern": "src/lib/services/tags*.ts",
+      "docs": ["docs/feature_deep_dives/tag_system.md"]
+    },
+    {
+      "pattern": "src/lib/services/tagEvaluation.ts",
+      "docs": ["docs/feature_deep_dives/tag_system.md"]
+    },
+    {
+      "pattern": "src/lib/services/vectorsim.ts",
+      "docs": ["docs/feature_deep_dives/vector_search_embedding.md"]
+    },
+    {
+      "pattern": "src/lib/services/links*.ts",
+      "docs": ["docs/feature_deep_dives/link_whitelist_system.md"]
+    },
+    {
+      "pattern": "src/lib/services/linkWhitelist.ts",
+      "docs": ["docs/feature_deep_dives/link_whitelist_system.md"]
+    },
+    {
+      "pattern": "src/lib/services/linkResolver.ts",
+      "docs": ["docs/feature_deep_dives/link_whitelist_system.md"]
+    },
+    {
+      "pattern": "src/lib/services/linkCandidates.ts",
+      "docs": ["docs/feature_deep_dives/link_whitelist_system.md"]
+    },
+    {
+      "pattern": "src/lib/services/metrics.ts",
+      "docs": ["docs/feature_deep_dives/metrics_analytics.md"]
+    },
+    {
+      "pattern": "src/lib/services/explanations.ts",
+      "docs": ["docs/feature_deep_dives/search_generation_pipeline.md"]
+    },
+    {
+      "pattern": "src/lib/services/returnExplanation.ts",
+      "docs": ["docs/feature_deep_dives/search_generation_pipeline.md"]
+    },
+    {
+      "pattern": "src/lib/services/findMatches.ts",
+      "docs": ["docs/feature_deep_dives/search_generation_pipeline.md"]
+    },
+    {
+      "pattern": "src/lib/services/explanationSummarizer.ts",
+      "docs": ["docs/feature_deep_dives/explanation_summaries.md"]
+    },
+    {
+      "pattern": "src/actions/actions.ts",
+      "docs": ["docs/feature_deep_dives/server_action_patterns.md"]
+    },
+    {
+      "pattern": "src/editorFiles/**",
+      "docs": [
+        "docs/feature_deep_dives/lexical_editor_plugins.md",
+        "docs/feature_deep_dives/ai_suggestions_overview.md",
+        "docs/docs_overall/design_style_guide.md"
+      ]
+    },
+    {
+      "pattern": "src/lib/services/llms.ts",
+      "docs": ["docs/feature_deep_dives/ai_suggestions_overview.md"]
+    },
+    {
+      "pattern": "{tests,e2e}/**",
+      "docs": ["docs/docs_overall/testing_overview.md"]
+    },
+    {
+      "pattern": "src/testing/**",
+      "docs": ["docs/feature_deep_dives/testing_setup.md"]
+    },
+    {
+      "pattern": ".github/workflows/**",
+      "docs": ["docs/docs_overall/environments.md"]
+    },
+    {
+      "pattern": ".claude/**",
+      "docs": ["docs/docs_overall/managing_claude_settings.md"]
+    },
+    {
+      "pattern": ".claude/commands/debug*.md",
+      "docs": ["docs/feature_deep_dives/debugging_skill.md"]
+    },
+    {
+      "pattern": "src/lib/utils/supabase/**",
+      "docs": ["docs/feature_deep_dives/authentication_rls.md"]
+    },
+    {
+      "pattern": "src/middleware.ts",
+      "docs": ["docs/feature_deep_dives/authentication_rls.md"]
+    },
+    {
+      "pattern": "src/lib/services/*Tracing*.ts",
+      "docs": ["docs/feature_deep_dives/request_tracing_observability.md"]
+    },
+    {
+      "pattern": "src/lib/utils/logging/**",
+      "docs": ["docs/feature_deep_dives/request_tracing_observability.md"]
+    },
+    {
+      "pattern": "src/reducers/**",
+      "docs": ["docs/feature_deep_dives/state_management.md"]
+    },
+    {
+      "pattern": "src/hooks/**",
+      "docs": ["docs/feature_deep_dives/state_management.md"]
+    },
+    {
+      "pattern": "src/lib/services/sourceFetcher.ts",
+      "docs": ["docs/feature_deep_dives/add_sources_citations.md"]
+    },
+    {
+      "pattern": "src/lib/services/sourceSummarizer.ts",
+      "docs": ["docs/feature_deep_dives/add_sources_citations.md"]
+    },
+    {
+      "pattern": "src/lib/services/sourceCache.ts",
+      "docs": ["docs/feature_deep_dives/add_sources_citations.md"]
+    },
+    {
+      "pattern": "src/components/sources/**",
+      "docs": ["docs/feature_deep_dives/add_sources_citations.md"]
+    },
+    {
+      "pattern": "src/editorFiles/lexicalEditor/CitationPlugin.tsx",
+      "docs": ["docs/feature_deep_dives/add_sources_citations.md"]
+    },
+    {
+      "pattern": "src/app/api/fetchSourceMetadata/**",
+      "docs": ["docs/feature_deep_dives/add_sources_citations.md"]
+    },
+    {
+      "pattern": "src/components/**",
+      "docs": ["docs/docs_overall/design_style_guide.md"]
+    },
+    {
+      "pattern": "src/app/**/page.tsx",
+      "docs": ["docs/docs_overall/design_style_guide.md"]
+    },
+    {
+      "pattern": "src/app/**/layout.tsx",
+      "docs": ["docs/docs_overall/design_style_guide.md"]
+    },
+    {
+      "pattern": "src/hooks/**",
+      "docs": ["docs/docs_overall/design_style_guide.md", "docs/feature_deep_dives/state_management.md"]
+    },
+    {
+      "pattern": "src/contexts/**",
+      "docs": ["docs/docs_overall/design_style_guide.md", "docs/feature_deep_dives/state_management.md"]
+    },
+    {
+      "pattern": "src/lib/services/importArticle.ts",
+      "docs": ["docs/feature_deep_dives/search_generation_pipeline.md"]
+    },
+    {
+      "pattern": "src/lib/services/userLibrary.ts",
+      "docs": ["docs/feature_deep_dives/state_management.md"]
+    },
+    {
+      "pattern": "src/lib/services/userQueries.ts",
+      "docs": ["docs/feature_deep_dives/search_generation_pipeline.md"]
+    },
+    {
+      "pattern": "src/lib/services/topics.ts",
+      "docs": ["docs/feature_deep_dives/tag_system.md"]
+    },
+    {
+      "pattern": "src/editorFiles/markdownASTdiff/**",
+      "docs": ["docs/feature_deep_dives/markdown_ast_diffing.md"]
+    },
+    {
+      "pattern": "src/lib/errorHandling.ts",
+      "docs": ["docs/feature_deep_dives/error_handling.md"]
+    },
+    {
+      "pattern": "src/lib/errors/**",
+      "docs": ["docs/feature_deep_dives/error_handling.md"]
+    },
+    {
+      "pattern": "src/app/api/stream-chat/**",
+      "docs": ["docs/feature_deep_dives/realtime_streaming.md"]
+    },
+    {
+      "pattern": "src/lib/services/explanationTags.ts",
+      "docs": ["docs/feature_deep_dives/tag_system.md"]
+    },
+    {
+      "pattern": "src/lib/services/testingPipeline.ts",
+      "docs": ["docs/feature_deep_dives/testing_pipeline.md"]
+    },
+    {
+      "pattern": "src/app/api/monitoring/**",
+      "docs": ["docs/feature_deep_dives/request_tracing_observability.md"]
+    },
+    {
+      "pattern": "src/app/api/returnExplanation/**",
+      "docs": ["docs/feature_deep_dives/search_generation_pipeline.md"]
+    },
+    {
+      "pattern": "src/app/api/runAISuggestionsPipeline/**",
+      "docs": ["docs/feature_deep_dives/ai_suggestions_overview.md"]
+    },
+    {
+      "pattern": "src/app/api/traces/**",
+      "docs": ["docs/feature_deep_dives/request_tracing_observability.md"]
+    },
+    {
+      "pattern": "src/app/api/client-logs/**",
+      "docs": ["docs/feature_deep_dives/request_tracing_observability.md"]
+    },
+    {
+      "pattern": "src/app/api/health/**",
+      "docs": ["docs/docs_overall/environments.md"]
+    },
+    {
+      "pattern": "src/app/api/test-cases/**",
+      "docs": ["docs/feature_deep_dives/markdown_ast_diffing.md"]
+    },
+    {
+      "pattern": "src/app/api/test-responses/**",
+      "docs": ["docs/feature_deep_dives/markdown_ast_diffing.md"]
+    },
+    {
+      "pattern": "src/app/admin/**",
+      "docs": ["docs/feature_deep_dives/admin_panel.md"]
+    },
+    {
+      "pattern": "src/lib/services/admin*.ts",
+      "docs": ["docs/feature_deep_dives/admin_panel.md"]
+    },
+    {
+      "pattern": "src/lib/services/writing*.ts",
+      "docs": ["docs/feature_deep_dives/writing_pipeline.md"]
+    },
+    {
+      "pattern": "src/lib/services/evolution*.ts",
+      "docs": ["docs/evolution/architecture.md", "docs/evolution/visualization.md", "docs/evolution/hall_of_fame.md", "docs/evolution/agents/editing.md", "docs/evolution/cost_optimization.md", "docs/evolution/reference.md"]
+    },
+    {
+      "pattern": "src/lib/services/promptRegistryActions.ts",
+      "docs": ["docs/evolution/data_model.md"]
+    },
+    {
+      "pattern": "src/lib/services/strategyRegistryActions.ts",
+      "docs": ["docs/evolution/data_model.md"]
+    },
+    {
+      "pattern": "src/lib/services/unifiedExplorerActions.ts",
+      "docs": ["docs/evolution/data_model.md"]
+    },
+    {
+      "pattern": "scripts/backfill-prompt-ids.ts",
+      "docs": ["docs/evolution/data_model.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/**",
+      "docs": ["docs/evolution/architecture.md", "docs/evolution/data_model.md", "docs/evolution/hall_of_fame.md", "docs/evolution/agents/editing.md", "docs/evolution/cost_optimization.md", "docs/evolution/reference.md"]
+    },
+    {
+      "pattern": "src/lib/services/articleBank*.ts",
+      "docs": ["docs/evolution/hall_of_fame.md", "docs/evolution/cost_optimization.md"]
+    },
+    {
+      "pattern": "scripts/*bank*.ts",
+      "docs": ["docs/evolution/hall_of_fame.md", "docs/evolution/cost_optimization.md"]
+    },
+    {
+      "pattern": "scripts/generate-article*.ts",
+      "docs": ["docs/evolution/hall_of_fame.md", "docs/evolution/cost_optimization.md"]
+    },
+    {
+      "pattern": "src/lib/services/*recommend*.ts",
+      "docs": ["docs/feature_deep_dives/search_generation_pipeline.md"]
+    },
+    {
+      "pattern": "scripts/evolution*.ts",
+      "docs": ["docs/evolution/architecture.md", "docs/evolution/cost_optimization.md", "docs/evolution/reference.md"]
+    },
+    {
+      "pattern": "scripts/run-evolution*.ts",
+      "docs": ["docs/evolution/architecture.md", "docs/evolution/cost_optimization.md", "docs/evolution/reference.md"]
+    },
+    {
+      "pattern": "src/config/promptBankConfig.ts",
+      "docs": ["docs/evolution/hall_of_fame.md", "docs/evolution/cost_optimization.md"]
+    },
+    {
+      "pattern": "scripts/run-prompt-bank*.ts",
+      "docs": ["docs/evolution/hall_of_fame.md", "docs/evolution/cost_optimization.md"]
+    },
+    {
+      "pattern": "src/components/evolution/**",
+      "docs": ["docs/evolution/visualization.md", "docs/evolution/hall_of_fame.md", "docs/evolution/cost_optimization.md"]
+    },
+    {
+      "pattern": "src/lib/services/source*.ts",
+      "docs": ["docs/feature_deep_dives/manage_sources.md", "docs/feature_deep_dives/add_sources_citations.md"]
+    },
+    {
+      "pattern": "src/actions/*source*.ts",
+      "docs": ["docs/feature_deep_dives/manage_sources.md"]
+    },
+    {
+      "pattern": "src/components/*source*.tsx",
+      "docs": ["docs/feature_deep_dives/manage_sources.md"]
+    },
+    {
+      "pattern": "src/app/sources/**",
+      "docs": ["docs/feature_deep_dives/manage_sources.md"]
+    },
+    {
+      "pattern": "src/hooks/useSourceSubmit.ts",
+      "docs": ["docs/feature_deep_dives/manage_sources.md", "docs/feature_deep_dives/add_sources_citations.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/agents/*outline*.ts",
+      "docs": ["docs/evolution/agents/generation.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/treeOfThought/**",
+      "docs": ["docs/evolution/agents/tree_search.md"]
+    },
+    {
+      "pattern": "src/lib/services/decomposition*.ts",
+      "docs": ["docs/evolution/agents/editing.md"]
+    },
+    {
+      "pattern": "src/lib/decomposition/**",
+      "docs": ["docs/evolution/agents/editing.md"]
+    },
+    {
+      "pattern": "scripts/*decomposition*.ts",
+      "docs": ["docs/evolution/agents/editing.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/agents/*iterative*.ts",
+      "docs": ["docs/evolution/agents/editing.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/agents/*section*.ts",
+      "docs": ["docs/evolution/agents/editing.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/section/**",
+      "docs": ["docs/evolution/agents/editing.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/diffComparison.ts",
+      "docs": ["docs/evolution/agents/editing.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/agents/*treeSearch*.ts",
+      "docs": ["docs/evolution/agents/tree_search.md"]
+    },
+    {
+      "pattern": "scripts/run-strategy-experiment.ts",
+      "docs": ["docs/evolution/strategy_experiments.md", "docs/evolution/cost_optimization.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/experiment/**",
+      "docs": ["docs/evolution/strategy_experiments.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/agents/*debate*.ts",
+      "docs": ["docs/evolution/agents/support.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/agents/*reflect*.ts",
+      "docs": ["docs/evolution/agents/support.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/agents/*metaReview*.ts",
+      "docs": ["docs/evolution/agents/support.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/flowRubric*.ts",
+      "docs": ["docs/evolution/agents/flow_critique.md"]
+    },
+    {
+      "pattern": "src/lib/evolution/*flow*.ts",
+      "docs": ["docs/evolution/agents/flow_critique.md"]
+    },
+    {
+      "pattern": "src/app/admin/quality/evolution/article/**",
+      "docs": ["docs/feature_deep_dives/article_detail_view.md", "evolution/docs/evolution/visualization.md"]
+    }
+  ],
+  "alwaysConsider": [
+    "docs/docs_overall/architecture.md"
+  ]
+}

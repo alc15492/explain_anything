@@ -1,0 +1,175 @@
+import { Page, expect } from '@playwright/test';
+import { BasePage } from './BasePage';
+
+export class LoginPage extends BasePage {
+  // Use accessible selectors as primary (more robust than data-testid)
+  private emailInput = '#email';
+  private passwordInput = '#password';
+  private submitButton = 'button[type="submit"]';
+  private errorMessage = '[data-testid="login-error"]';
+  private signupToggle = 'button:has-text("Sign up")';
+  private rememberMeCheckbox = '#rememberMe';
+
+  constructor(page: Page) {
+    super(page);
+  }
+
+  async navigate() {
+    await super.navigate('/login');
+  }
+
+  async login(email: string, password: string) {
+    // Wait for form to be ready (React hydration complete)
+    await this.page.locator(this.emailInput).waitFor({ state: 'visible' });
+
+    // Clear and fill with verification to handle React Hook Form race conditions
+    const emailLocator = this.page.locator(this.emailInput);
+    const passwordLocator = this.page.locator(this.passwordInput);
+
+    // Fill email and verify it took
+    await emailLocator.clear();
+    await emailLocator.fill(email);
+    await emailLocator.blur(); // Trigger validation
+
+    // Retry if email didn't stick (React Hook Form race condition)
+    const emailValue = await emailLocator.inputValue();
+    if (emailValue !== email) {
+      await emailLocator.click();
+      await emailLocator.pressSequentially(email, { delay: 50 });
+    }
+
+    // Fill password
+    await passwordLocator.clear();
+    await passwordLocator.fill(password);
+    await passwordLocator.blur();
+
+    await this.page.locator(this.submitButton).click();
+    // Wait for navigation or response after form submission
+    await this.page.waitForLoadState('domcontentloaded');
+  }
+
+  async getErrorMessage() {
+    const errorElement = this.page.locator(this.errorMessage);
+    if (await errorElement.isVisible()) {
+      return await errorElement.textContent();
+    }
+    return null;
+  }
+
+  async isErrorVisible() {
+    return await this.page.locator(this.errorMessage).isVisible();
+  }
+
+  async toggleToSignup() {
+    await this.page.click(this.signupToggle);
+    // Wait for signup form to become visible after toggle
+    await expect(this.page.locator('form')).toBeVisible({ timeout: 5000 });
+  }
+
+  async isLoggedIn() {
+    const cookies = await this.page.context().cookies();
+    // Supabase cookies use 'sb-' prefix or 'supabase' in name
+    return cookies.some((c) => c.name.includes('supabase') || c.name.startsWith('sb-'));
+  }
+
+  async fillEmail(email: string) {
+    const input = this.page.locator(this.emailInput);
+    await input.waitFor({ state: 'visible' });
+    await input.clear();
+    await input.fill(email);
+    await input.blur();
+  }
+
+  async fillPassword(password: string) {
+    const input = this.page.locator(this.passwordInput);
+    await input.waitFor({ state: 'visible' });
+    await input.clear();
+    await input.fill(password);
+    await input.blur();
+  }
+
+  async clickSubmit() {
+    await this.page.locator(this.submitButton).click();
+    // Wait for navigation or response after form submission
+    await this.page.waitForLoadState('domcontentloaded');
+  }
+
+  async isRememberMeVisible() {
+    return await this.page.locator(this.rememberMeCheckbox).isVisible();
+  }
+
+  async isRememberMeChecked() {
+    return await this.page.locator(this.rememberMeCheckbox).isChecked();
+  }
+
+  async toggleRememberMe() {
+    const checkbox = this.page.locator(this.rememberMeCheckbox);
+    const wasPreviouslyChecked = await checkbox.isChecked();
+    await checkbox.click();
+    // Verify checkbox state actually changed
+    if (wasPreviouslyChecked) {
+      await expect(checkbox).not.toBeChecked({ timeout: 3000 });
+    } else {
+      await expect(checkbox).toBeChecked({ timeout: 3000 });
+    }
+  }
+
+  async loginWithRememberMe(email: string, password: string, rememberMe: boolean) {
+    await this.page.locator(this.emailInput).waitFor({ state: 'visible' });
+
+    // Clear and fill with verification to handle React Hook Form race conditions
+    const emailLocator = this.page.locator(this.emailInput);
+    const passwordLocator = this.page.locator(this.passwordInput);
+
+    // Fill email and verify it took
+    await emailLocator.clear();
+    await emailLocator.fill(email);
+    await emailLocator.blur();
+
+    const emailValue = await emailLocator.inputValue();
+    if (emailValue !== email) {
+      await emailLocator.click();
+      await emailLocator.pressSequentially(email, { delay: 50 });
+    }
+
+    // Fill password
+    await passwordLocator.clear();
+    await passwordLocator.fill(password);
+    await passwordLocator.blur();
+
+    const isChecked = await this.isRememberMeChecked();
+    if (rememberMe !== isChecked) {
+      await this.toggleRememberMe();
+    }
+
+    await this.page.locator(this.submitButton).click();
+    // Wait for navigation or response after form submission
+    await this.page.waitForLoadState('domcontentloaded');
+  }
+
+  async getRememberMePreference(): Promise<string | null> {
+    return await this.page.evaluate(() => {
+      return localStorage.getItem('supabase_remember_me');
+    });
+  }
+
+  async getSupabaseStorageType(): Promise<'localStorage' | 'sessionStorage' | 'none'> {
+    return await this.page.evaluate(() => {
+      // Check if Supabase auth data is in localStorage
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key?.startsWith('sb-')) {
+          return 'localStorage';
+        }
+      }
+      // Check if Supabase auth data is in sessionStorage
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        if (key?.startsWith('sb-')) {
+          return 'sessionStorage';
+        }
+      }
+      return 'none';
+    });
+  }
+}

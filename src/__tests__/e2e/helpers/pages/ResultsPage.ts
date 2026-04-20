@@ -1,0 +1,768 @@
+import { Page } from '@playwright/test';
+import { BasePage } from './BasePage';
+import { safeIsVisible, safeWaitFor } from '../error-utils';
+
+export class ResultsPage extends BasePage {
+  // Selectors
+  private explanationTitle = '[data-testid="explanation-title"]';
+  private explanationContent = '[data-testid="explanation-content"]';
+  private streamCompleteIndicator = '[data-testid="stream-complete"]';
+  private saveToLibraryButton = '[data-testid="save-to-library"]';
+  private tagItem = '[data-testid="tag-item"]';
+  private loadingIndicator = '[data-testid="loading-indicator"]';
+  private tagAddInput = '[data-testid="tag-add-input"]';
+  private tagAddButton = '[data-testid="tag-add-button"]';
+  private tagApplyButton = '[data-testid="tag-apply-button"]';
+  private tagResetButton = '[data-testid="tag-reset-button"]';
+  private errorMessage = '[data-testid="error-message"]';
+  private rewriteButton = '[data-testid="rewrite-button"]';
+  private rewriteDropdownToggle = '[data-testid="rewrite-dropdown-toggle"]';
+  private rewriteWithTags = '[data-testid="rewrite-with-tags"]';
+  private editWithTags = '[data-testid="edit-with-tags"]';
+  private formatToggleButton = '[data-testid="format-toggle-button"]';
+  private editButton = '[data-testid="edit-button"]';
+  private publishButton = '[data-testid="publish-button"]';
+  private modeSelect = '[data-testid="mode-select"]';
+
+  // AI Suggestions Panel selectors
+  private aiSuggestionsPanel = '[data-testid="ai-suggestions-panel"]';
+  private aiPromptInput = '#ai-prompt';
+  private getSuggestionsButton = 'button:has-text("Get Suggestions")';
+  private suggestionsLoading = 'button:has-text("Composing...")';
+  private suggestionsSuccess = '[data-testid="suggestions-success"]';
+  private suggestionsError = '[data-testid="suggestions-error"]';
+
+  // Diff node selectors
+  private diffNodes = '[data-diff-key]';
+  private insertionNodes = '[data-diff-type="ins"]';
+  private deletionNodes = '[data-diff-type="del"]';
+  private acceptButton = 'button[data-action="accept"]';
+  private rejectButton = 'button[data-action="reject"]';
+
+  constructor(page: Page) {
+    super(page);
+  }
+
+  async navigate(query?: string) {
+    if (query) {
+      await super.navigate(`/results?q=${encodeURIComponent(query)}`);
+    } else {
+      await super.navigate('/results');
+    }
+  }
+
+  // Streaming state methods
+  async waitForStreamingStart(timeout = 30000) {
+    // Wait for title to appear (indicates streaming has started)
+    await this.page.locator(this.explanationTitle).waitFor({ state: 'visible', timeout });
+  }
+
+  async waitForStreamingComplete(timeout = 60000) {
+    // Race between: URL redirect (success) vs Error visible (failure)
+    // This prevents 60s timeouts when streaming fails with a database error
+    const errorLocator = this.page.locator('[data-testid="error-message"]');
+
+    const result = await Promise.race([
+      // Success path: URL changes to include explanation_id
+      this.page.waitForURL(/\/results\?.*explanation_id=/, { timeout })
+        .then(() => ({ success: true as const })),
+      // Failure path: Error message becomes visible
+      errorLocator.first().waitFor({ state: 'visible', timeout })
+        .then(async () => ({
+          success: false as const,
+          error: await errorLocator.first().textContent() || 'Unknown error'
+        })),
+    ]).catch((e) => ({
+      success: false as const,
+      error: `Timeout waiting for streaming: ${e instanceof Error ? e.message : String(e)}`
+    }));
+
+    if (!result.success) {
+      // Log current page state for debugging
+      const url = this.page.url();
+      const errorMsg = 'error' in result ? result.error : 'Unknown error';
+      console.error('[waitForStreamingComplete] FAILED:', {
+        error: errorMsg,
+        currentUrl: url,
+      });
+      throw new Error(`Streaming failed: ${errorMsg}`);
+    }
+
+    // Wait for page to fully load after redirect
+    // The data-user-saved-loaded attribute is set when loadExplanation completes
+    try {
+      await this.page.waitForSelector('[data-testid="save-to-library"][data-user-saved-loaded="true"]', {
+        timeout: 30000
+      });
+    } catch {
+      // Fallback: wait for title or content to appear
+      // If neither appears within timeout, proceed anyway (best-effort)
+      // eslint-disable-next-line flakiness/no-silent-catch -- Best-effort fallback, URL redirect is authoritative
+      await Promise.race([
+        this.page.locator(this.explanationTitle).waitFor({ state: 'visible', timeout: 10000 }),
+        this.page.locator(this.explanationContent).waitFor({ state: 'visible', timeout: 10000 }),
+      ]).catch(() => {
+        // Both failed - proceed without additional delay
+        // The URL redirect (checked before this) is the authoritative signal
+      });
+    }
+
+    // Optionally verify stream-complete indicator is attached (should be present after redirect)
+    await safeWaitFor(this.page.locator(this.streamCompleteIndicator), 'attached', 'ResultsPage.waitForStreamingComplete.indicator', 5000);
+  }
+
+  async isStreamComplete() {
+    // Check if element exists in DOM (not visible, since it has hidden class)
+    return await this.page.locator(this.streamCompleteIndicator).count() > 0;
+  }
+
+  // Content methods
+  async getTitle() {
+    const element = this.page.locator(this.explanationTitle);
+    await element.waitFor({ state: 'visible' });
+    return await element.innerText();
+  }
+
+  async getContent() {
+    const element = this.page.locator(this.explanationContent);
+    await element.waitFor({ state: 'visible' });
+    return await element.innerText();
+  }
+
+  async getContentLength() {
+    const content = await this.getContent();
+    return content.length;
+  }
+
+  async hasContent() {
+    return await this.page.isVisible(this.explanationContent);
+  }
+
+  // Tag methods
+  async getTags() {
+    // Wait for tags to appear, return empty array if none exist
+    const found = await safeWaitFor(this.page.locator(this.tagItem).first(), 'visible', 'ResultsPage.getTags', 10000);
+    if (!found) return [];
+    const tags = this.page.locator(this.tagItem);
+    const count = await tags.count();
+    const tagTexts: string[] = [];
+    for (let i = 0; i < count; i++) {
+      tagTexts.push(await tags.nth(i).innerText());
+    }
+    return tagTexts;
+  }
+
+  async getTagCount() {
+    // Wait for tags to appear, return 0 if none exist
+    const found = await safeWaitFor(this.page.locator(this.tagItem).first(), 'visible', 'ResultsPage.getTagCount', 10000);
+    if (!found) return 0;
+    return await this.page.locator(this.tagItem).count();
+  }
+
+  async hasTags() {
+    const count = await this.getTagCount();
+    return count > 0;
+  }
+
+  // Tag management methods
+  async addTag(tagName: string) {
+    const input = this.page.locator(this.tagAddInput);
+    await input.waitFor({ state: 'visible' });
+
+    // Clear and fill with verification to handle React controlled input race conditions
+    await input.clear();
+    await input.fill(tagName);
+    await input.blur();
+
+    // Verify value stuck (React controlled input race condition)
+    const value = await input.inputValue();
+    if (value !== tagName) {
+      await input.click();
+      await input.pressSequentially(tagName, { delay: 50 });
+    }
+
+    await this.page.locator(this.tagAddButton).click();
+    // Wait for the tag to appear after adding
+    await this.page.locator(this.tagItem).last().waitFor({ state: 'visible', timeout: 5000 });
+  }
+
+  async removeTag(index: number) {
+    await this.page.click(`[data-testid="tag-remove-${index}"]`);
+    // Wait for tag removal animation/update to complete
+    // eslint-disable-next-line flakiness/no-silent-catch -- best-effort wait for tag removal animation
+    await this.page.locator(`[data-testid="tag-remove-${index}"]`).waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+  }
+
+  async clickApplyTags() {
+    await this.page.click(this.tagApplyButton);
+    // eslint-disable-next-line flakiness/no-silent-catch -- best-effort wait for apply button to hide after tags applied
+    await this.page.waitForSelector(this.tagApplyButton, { state: 'hidden', timeout: 10000 }).catch(() => null);
+  }
+
+  async clickResetTags() {
+    await this.page.click(this.tagResetButton);
+    // eslint-disable-next-line flakiness/no-silent-catch -- best-effort wait for reset; button may already be hidden
+    await this.page.waitForSelector(this.tagApplyButton, { state: 'hidden', timeout: 5000 }).catch(() => null);
+  }
+
+  async isApplyButtonEnabled() {
+    return !(await this.page.isDisabled(this.tagApplyButton));
+  }
+
+  async isApplyButtonVisible() {
+    return await this.page.isVisible(this.tagApplyButton);
+  }
+
+  async isResetButtonVisible() {
+    return await this.page.isVisible(this.tagResetButton);
+  }
+
+  // Save to library methods
+  async clickSaveToLibrary() {
+    await this.page.click(this.saveToLibraryButton);
+    // eslint-disable-next-line flakiness/no-silent-catch -- best-effort wait for save confirmation
+    await this.waitForSaveComplete().catch(() => null);
+  }
+
+  async isSaveToLibraryEnabled() {
+    return !(await this.page.isDisabled(this.saveToLibraryButton));
+  }
+
+  async isSaveToLibraryVisible() {
+    return await this.page.isVisible(this.saveToLibraryButton);
+  }
+
+  // Loading state methods
+  async isLoading() {
+    return await safeIsVisible(
+      this.page.locator(this.loadingIndicator),
+      'ResultsPage.isLoading'
+    );
+  }
+
+  async waitForLoadingToFinish(timeout = 30000) {
+    await safeWaitFor(
+      this.page.locator(this.loadingIndicator),
+      'hidden',
+      'ResultsPage.waitForLoadingToFinish',
+      timeout
+    );
+  }
+
+  // URL parameter helpers
+  async getQueryFromUrl() {
+    const url = new URL(this.page.url());
+    return url.searchParams.get('q') || '';
+  }
+
+  async getExplanationIdFromUrl() {
+    const url = new URL(this.page.url());
+    return url.searchParams.get('explanation_id') || '';
+  }
+
+  async hasExplanationIdInUrl() {
+    const id = await this.getExplanationIdFromUrl();
+    return id.length > 0;
+  }
+
+  // Wait for complete generation
+  async waitForCompleteGeneration(timeout = 60000) {
+    await this.waitForStreamingStart(timeout);
+    await this.waitForStreamingComplete(timeout);
+  }
+
+  // Wait for existing explanation to load (not streaming, just DB fetch)
+  async waitForExplanationToLoad(timeout = 60000) {
+    // Wait for either title or content to appear (whichever comes first)
+    await Promise.race([
+      this.page.locator(this.explanationTitle).waitFor({ state: 'visible', timeout }),
+      this.page.locator(this.explanationContent).waitFor({ state: 'visible', timeout }),
+    ]);
+  }
+
+  // Wait for any content to render (handles both streaming and DB load scenarios)
+  async waitForAnyContent(timeout = 60000) {
+    // Race content appearance against error-message appearance so we fail fast
+    // instead of waiting the full timeout when the server returns an error state.
+    // The title only renders when BOTH data is loaded AND isPageLoading is false.
+    type Result =
+      | { kind: 'content' }
+      | { kind: 'error'; text: string }
+      | { kind: 'timeout' };
+
+    const result = await Promise.race<Result>([
+      this.page.locator(this.explanationTitle).waitFor({ state: 'visible', timeout })
+        .then(() => ({ kind: 'content' as const })),
+      this.page.locator(this.explanationContent).waitFor({ state: 'visible', timeout })
+        .then(() => ({ kind: 'content' as const })),
+      this.page.locator('[data-testid="error-message"]').waitFor({ state: 'visible', timeout })
+        .then(async () => {
+          const text = await this.page.locator('[data-testid="error-message"]').first().textContent().catch(() => '');
+          return { kind: 'error' as const, text: text ?? '' };
+        }),
+    ]).catch((error: Error) => {
+      // If page was closed, re-throw immediately
+      if (error.message?.includes('closed') || error.message?.includes('Target')) {
+        throw error;
+      }
+      return { kind: 'timeout' as const };
+    });
+
+    if (result.kind === 'error') {
+      throw new Error(`Page loaded with error state instead of content: ${result.text}`);
+    }
+    if (result.kind === 'timeout') {
+      throw new Error('Timeout waiting for explanation content to appear');
+    }
+    // result.kind === 'content' — success
+  }
+
+  // Wait for lifecycle phase to be 'viewing' (state machine ready for edit mode)
+  async waitForViewingPhase(timeout = 30000) {
+    await this.page.waitForSelector('[data-lifecycle-phase="viewing"]', { timeout });
+  }
+
+  // Wait for userSaved state to be determined (async check completes)
+  async waitForUserSavedState(timeout = 30000) {
+    await this.page.waitForSelector('[data-testid="save-to-library"][data-user-saved-loaded="true"]', { timeout });
+  }
+
+  // Error handling methods
+  async getErrorMessage(): Promise<string | null> {
+    const errorElement = this.page.locator(this.errorMessage);
+    const found = await safeWaitFor(errorElement, 'visible', 'ResultsPage.getErrorMessage', 2000);
+    if (!found) return null;
+    return await errorElement.innerText();
+  }
+
+  async waitForError(timeout = 30000) {
+    await this.page.locator(this.errorMessage).waitFor({ state: 'visible', timeout });
+  }
+
+  async isErrorVisible(): Promise<boolean> {
+    return await this.page.isVisible(this.errorMessage);
+  }
+
+  // Rewrite/Regeneration methods
+  async clickRewriteButton() {
+    const button = this.page.locator(this.rewriteButton);
+    await button.waitFor({ state: 'visible' });
+    await button.click();
+    // eslint-disable-next-line flakiness/no-silent-catch -- best-effort wait; button may transition to disabled state
+    await button.waitFor({ state: 'visible', timeout: 5000 }).catch(() => null);
+  }
+
+  async isRewriteButtonVisible(): Promise<boolean> {
+    return await this.page.isVisible(this.rewriteButton);
+  }
+
+  async isRewriteButtonEnabled(): Promise<boolean> {
+    const button = this.page.locator(this.rewriteButton);
+    if (!(await button.isVisible())) return false;
+    return !(await button.isDisabled());
+  }
+
+  async openRewriteDropdown() {
+    const button = this.page.locator(this.rewriteDropdownToggle);
+    await button.waitFor({ state: 'visible' });
+    await button.click();
+    // Wait for dropdown menu to appear
+    await this.page.locator(this.rewriteWithTags).waitFor({ state: 'visible', timeout: 5000 });
+  }
+
+  async isRewriteDropdownVisible(): Promise<boolean> {
+    return await this.page.isVisible(this.rewriteWithTags);
+  }
+
+  async clickRewriteWithTags() {
+    const button = this.page.locator(this.rewriteWithTags);
+    await button.waitFor({ state: 'visible' });
+    await button.click();
+    await this.page.locator('[data-testid="add-tag-trigger"]').waitFor({ state: 'visible', timeout: 5000 });
+  }
+
+  async clickEditWithTags() {
+    const button = this.page.locator(this.editWithTags);
+    await button.waitFor({ state: 'visible' });
+    await button.click();
+    await this.page.locator('[data-testid="add-tag-trigger"]').waitFor({ state: 'visible', timeout: 5000 });
+  }
+
+  // ============= AI Suggestions Panel Methods =============
+
+  async isAISuggestionsPanelVisible(): Promise<boolean> {
+    return await this.page.isVisible(this.aiSuggestionsPanel);
+  }
+
+  async submitAISuggestion(prompt: string) {
+    const input = this.page.locator(this.aiPromptInput);
+    await input.waitFor({ state: 'visible' });
+
+    // Clear and fill with verification to handle React controlled input race conditions
+    await input.clear();
+    await input.fill(prompt);
+    await input.blur();
+
+    // Verify value stuck
+    const value = await input.inputValue();
+    if (value !== prompt) {
+      await input.click();
+      await input.pressSequentially(prompt, { delay: 50 });
+    }
+
+    const button = this.page.locator(this.getSuggestionsButton);
+    await button.waitFor({ state: 'visible' });
+    await button.click();
+    // Wait for loading state to begin (button text changes to "Composing...")
+    await safeWaitFor(this.page.locator(this.suggestionsLoading), 'visible', 'ResultsPage.submitAISuggestion', 5000);
+  }
+
+  async waitForSuggestionsLoading(timeout = 5000) {
+    await this.page.locator(this.suggestionsLoading).waitFor({ state: 'visible', timeout });
+  }
+
+  async waitForSuggestionsComplete(timeout = 30000) {
+    await this.page.locator(this.suggestionsSuccess).waitFor({ state: 'visible', timeout });
+  }
+
+  async waitForSuggestionsError(timeout = 10000) {
+    await this.page.locator(this.suggestionsError).waitFor({ state: 'visible', timeout });
+  }
+
+  async getSuggestionsErrorText(): Promise<string | null> {
+    const errorElement = this.page.locator(this.suggestionsError);
+    const found = await safeWaitFor(errorElement, 'visible', 'ResultsPage.getSuggestionsErrorText', 2000);
+    if (!found) return null;
+    return await errorElement.innerText();
+  }
+
+  // ============= Diff Interaction Methods =============
+
+  async getDiffCount(): Promise<number> {
+    return await this.page.locator(this.diffNodes).count();
+  }
+
+  async getInsertionCount(): Promise<number> {
+    return await this.page.locator(this.insertionNodes).count();
+  }
+
+  async getDeletionCount(): Promise<number> {
+    return await this.page.locator(this.deletionNodes).count();
+  }
+
+  async acceptDiff(index: number = 0) {
+    const diff = this.page.locator(this.diffNodes).nth(index);
+    await diff.hover();
+    // Wait for button to appear after hover (CSS transition)
+    const button = diff.locator(this.acceptButton);
+    await button.waitFor({ state: 'visible', timeout: 5000 });
+    await button.click();
+    // eslint-disable-next-line flakiness/no-silent-catch -- best-effort wait; diff removal may happen before wait starts
+    await diff.waitFor({ state: 'detached', timeout: 5000 }).catch(() => null);
+  }
+
+  async rejectDiff(index: number = 0) {
+    const diff = this.page.locator(this.diffNodes).nth(index);
+    await diff.hover();
+    // Wait for button to appear after hover (CSS transition)
+    const button = diff.locator(this.rejectButton);
+    await button.waitFor({ state: 'visible', timeout: 5000 });
+    await button.click();
+    // eslint-disable-next-line flakiness/no-silent-catch -- best-effort wait; diff removal may happen before wait starts
+    await diff.waitFor({ state: 'detached', timeout: 5000 }).catch(() => null);
+  }
+
+  async acceptAllDiffs() {
+    let count = await this.getDiffCount();
+    while (count > 0) {
+      await this.acceptDiff(0);
+      // Wait for diff count to actually change
+      const previousCount = count;
+      await this.page.waitForFunction(
+        (prev) => document.querySelectorAll('[data-diff-key]').length < prev,
+        previousCount,
+        { timeout: 5000 }
+      ).catch((err) => {
+        // Intentional: waitForFunction may timeout if diff count doesn't change fast enough
+        console.warn('[acceptAllDiffs] waitForFunction timeout:', err instanceof Error ? err.message : err);
+      });
+      count = await this.getDiffCount();
+    }
+  }
+
+  async rejectAllDiffs() {
+    let count = await this.getDiffCount();
+    while (count > 0) {
+      await this.rejectDiff(0);
+      // Wait for diff count to actually change
+      const previousCount = count;
+      await this.page.waitForFunction(
+        (prev) => document.querySelectorAll('[data-diff-key]').length < prev,
+        previousCount,
+        { timeout: 5000 }
+      ).catch((err) => {
+        // Intentional: waitForFunction may timeout if diff count doesn't change fast enough
+        console.warn('[rejectAllDiffs] waitForFunction timeout:', err instanceof Error ? err.message : err);
+      });
+      count = await this.getDiffCount();
+    }
+  }
+
+  async getDiffText(index: number = 0): Promise<string> {
+    return await this.page.locator(this.diffNodes).nth(index).innerText();
+  }
+
+  async isDiffAcceptButtonVisible(index: number = 0): Promise<boolean> {
+    const diff = this.page.locator(this.diffNodes).nth(index);
+    await diff.hover();
+    // Wait briefly for CSS transition after hover
+    const button = diff.locator(this.acceptButton);
+    return await safeWaitFor(button, 'visible', 'ResultsPage.isDiffAcceptButtonVisible', 2000);
+  }
+
+  async isDiffRejectButtonVisible(index: number = 0): Promise<boolean> {
+    const diff = this.page.locator(this.diffNodes).nth(index);
+    await diff.hover();
+    // Wait briefly for CSS transition after hover
+    const button = diff.locator(this.rejectButton);
+    return await safeWaitFor(button, 'visible', 'ResultsPage.isDiffRejectButtonVisible', 2000);
+  }
+
+  // Format toggle methods
+  async clickFormatToggle() {
+    // Capture current toggle text to detect state change
+    const currentText = await this.getFormatToggleText();
+    await this.page.click(this.formatToggleButton);
+    // Wait for format toggle text to change (indicates content format transition)
+    await this.page.waitForFunction(
+      ([selector, prevText]) => {
+        const btn = document.querySelector(selector as string);
+        return btn?.textContent !== prevText;
+      },
+      [this.formatToggleButton, currentText] as const,
+      { timeout: 5000 }
+    );
+  }
+
+  async isFormatToggleVisible(): Promise<boolean> {
+    return await this.page.isVisible(this.formatToggleButton);
+  }
+
+  async getFormatToggleText(): Promise<string> {
+    const button = this.page.locator(this.formatToggleButton);
+    return await button.innerText();
+  }
+
+  async isMarkdownMode(): Promise<boolean> {
+    const text = await this.getFormatToggleText();
+    return text === 'Plain Text'; // Shows "Plain Text" when in markdown mode
+  }
+
+  async isPlainTextMode(): Promise<boolean> {
+    const text = await this.getFormatToggleText();
+    return text === 'Formatted'; // Shows "Formatted" when in plain text mode
+  }
+
+  // Edit mode methods
+  async clickEditButton() {
+    // Capture current text to detect transition direction
+    const currentText = await this.page.locator(this.editButton).innerText();
+    await this.page.click(this.editButton);
+    // Wait for button text to change (Edit→Done or Done→Edit)
+    const expectedText = currentText === 'Edit' ? 'Done' : 'Edit';
+    await this.page.locator(`${this.editButton}:has-text("${expectedText}")`).waitFor({ state: 'visible', timeout: 5000 });
+  }
+
+  async isEditButtonVisible(): Promise<boolean> {
+    return await this.page.isVisible(this.editButton);
+  }
+
+  async getEditButtonText(): Promise<string> {
+    const button = this.page.locator(this.editButton);
+    return await button.innerText();
+  }
+
+  async isInEditMode(): Promise<boolean> {
+    const text = await this.getEditButtonText();
+    return text === 'Done'; // Shows "Done" when in edit mode
+  }
+
+  // Publish button methods
+  async clickPublishButton() {
+    const responsePromise = this.page.waitForResponse(
+      resp => resp.url().includes('/explanations') && resp.status() === 200,
+      { timeout: 10000 }
+    );
+    await this.page.click(this.publishButton);
+    await responsePromise;
+  }
+
+  async isPublishButtonVisible(): Promise<boolean> {
+    return await this.page.isVisible(this.publishButton);
+  }
+
+  async isPublishButtonEnabled(): Promise<boolean> {
+    const button = this.page.locator(this.publishButton);
+    if (!(await button.isVisible())) return false;
+    return !(await button.isDisabled());
+  }
+
+  async getPublishButtonText(): Promise<string> {
+    const button = this.page.locator(this.publishButton);
+    return await button.innerText();
+  }
+
+  // Mode dropdown methods
+  async selectMode(mode: 'Normal' | 'Skip Match' | 'Force Match') {
+    await this.page.selectOption(this.modeSelect, { label: mode });
+    // Wait for the selected value to update
+    await this.page.locator(this.modeSelect).waitFor({ state: 'visible', timeout: 5000 });
+  }
+
+  async getSelectedMode(): Promise<string> {
+    const select = this.page.locator(this.modeSelect);
+    return await select.inputValue();
+  }
+
+  async isModeSelectVisible(): Promise<boolean> {
+    return await this.page.isVisible(this.modeSelect);
+  }
+
+  async isModeSelectEnabled(): Promise<boolean> {
+    const select = this.page.locator(this.modeSelect);
+    if (!(await select.isVisible())) return false;
+    return !(await select.isDisabled());
+  }
+
+  // Save button text getter
+  async getSaveButtonText(): Promise<string> {
+    const button = this.page.locator(this.saveToLibraryButton);
+    return await button.innerText();
+  }
+
+  // Wait for save to complete
+  async waitForSaveComplete(timeout = 10000) {
+    // Wait for button text to change to "Saved ✓"
+    await this.page.waitForFunction(
+      (selector) => {
+        const button = document.querySelector(selector);
+        return button?.textContent?.includes('Saved');
+      },
+      this.saveToLibraryButton,
+      { timeout }
+    );
+  }
+
+  // Tag addition methods
+  async clickAddTagTrigger() {
+    // Wait for TagBar to be in normal mode (not modified) by checking for the trigger
+    // The add-tag-trigger only appears when isTagsModified is false AND showAddTagInput is false
+    // First wait for any tag-related element to ensure TagBar is rendered
+    await this.page.locator('[data-testid="add-tag-trigger"], [data-testid="tag-add-input"]').first().waitFor({
+      state: 'visible',
+      timeout: 15000
+    });
+
+    // If the input is already showing, we're good - the trigger was already clicked
+    const inputVisible = await this.page.locator('[data-testid="tag-add-input"]').isVisible();
+    if (inputVisible) {
+      return; // Already in add-tag mode
+    }
+
+    // Otherwise click the trigger
+    await this.page.locator('[data-testid="add-tag-trigger"]').click();
+  }
+
+  async isAddTagInputVisible(): Promise<boolean> {
+    return await this.page.isVisible('[data-testid="tag-add-input"]');
+  }
+
+  async isTagDropdownVisible(): Promise<boolean> {
+    return await this.page.isVisible('[data-testid="tag-dropdown"]');
+  }
+
+  async getTagDropdownOptions(): Promise<string[]> {
+    const options = this.page.locator('[data-testid="tag-dropdown-option"]');
+    const count = await options.count();
+    const texts: string[] = [];
+    for (let i = 0; i < count; i++) {
+      texts.push(await options.nth(i).innerText());
+    }
+    return texts;
+  }
+
+  async filterTagDropdown(text: string) {
+    const input = this.page.locator('[data-testid="tag-add-input"]');
+    await input.waitFor({ state: 'visible' });
+    await input.clear();
+    await input.fill(text);
+    await input.blur();
+    // Wait for dropdown to update with filtered results
+    await this.page.locator('[data-testid="tag-dropdown"]').waitFor({ state: 'visible', timeout: 5000 });
+  }
+
+  async selectTagFromDropdown(index: number) {
+    await this.page.locator('[data-testid="tag-dropdown-option"]').nth(index).click();
+    // Wait for tag selection to be reflected (dropdown closes or tag appears)
+    await this.page.locator('[data-testid="tag-dropdown"]').waitFor({ state: 'hidden', timeout: 5000 });
+  }
+
+  async clickCancelAddTag() {
+    // Wait for cancel button to be visible and clickable
+    const cancelButton = this.page.locator('[data-testid="tag-cancel-button"]');
+    await cancelButton.waitFor({ state: 'visible', timeout: 5000 });
+    // Click the cancel button - may need retry due to React state timing
+    await cancelButton.click();
+    // Wait for input to be hidden, retry click if needed
+    try {
+      await this.page.waitForSelector('[data-testid="tag-add-input"]', { state: 'hidden', timeout: 2000 });
+    } catch {
+      // First click may not have registered, try again
+      await cancelButton.click();
+      await this.page.waitForSelector('[data-testid="tag-add-input"]', { state: 'hidden', timeout: 3000 });
+    }
+  }
+
+  // Changes panel methods
+  async clickChangesPanelToggle() {
+    const panelWasVisible = await this.page.locator('[data-testid="changes-panel"]').isVisible();
+    await this.page.click('[data-testid="changes-panel-toggle"]');
+    // Wait for panel state to actually change
+    const expectedState = panelWasVisible ? 'hidden' : 'visible';
+    await this.page.locator('[data-testid="changes-panel"]').waitFor({ state: expectedState, timeout: 5000 });
+  }
+
+  async isChangesPanelVisible(): Promise<boolean> {
+    return await this.page.isVisible('[data-testid="changes-panel"]');
+  }
+
+  async getAddedTags(): Promise<string[]> {
+    const items = this.page.locator('[data-testid="change-added"]');
+    const count = await items.count();
+    const texts: string[] = [];
+    for (let i = 0; i < count; i++) {
+      texts.push(await items.nth(i).innerText());
+    }
+    return texts;
+  }
+
+  async getRemovedTags(): Promise<string[]> {
+    const items = this.page.locator('[data-testid="change-removed"]');
+    const count = await items.count();
+    const texts: string[] = [];
+    for (let i = 0; i < count; i++) {
+      texts.push(await items.nth(i).innerText());
+    }
+    return texts;
+  }
+
+  async getSwitchedTags(): Promise<string[]> {
+    const items = this.page.locator('[data-testid="change-switched"]');
+    const count = await items.count();
+    const texts: string[] = [];
+    for (let i = 0; i < count; i++) {
+      texts.push(await items.nth(i).innerText());
+    }
+    return texts;
+  }
+}

@@ -1,0 +1,401 @@
+'use server'
+
+import { createSupabaseServerClient } from '@/lib/utils/supabase/server';
+import { logger } from '@/lib/server_utilities';
+import { type TagFullDbType, type TagInsertType, tagInsertSchema } from '@/lib/schemas/schemas';
+import { type TagUIType, simpleTagUISchema, PresetTagUISchema } from '@/lib/schemas/schemas';
+import { withLogging } from '@/lib/logging/server/automaticServerLoggingBase';
+
+/**
+ * Helper function to convert raw database tags to UI format
+ * 
+ * • Groups tags by presetTagId for processing
+ * • Fetches all related tags for preset tag collections
+ * • Creates proper TagUIType objects (simple or preset collections)
+ * • Validates output with Zod schemas
+ * • Used by getTagsForExplanation and getTempTagsForRewriteWithTags
+ * • Calls getTagsByPresetId for fetching related preset tags
+ * 
+ * Used by: getTagsForExplanation, getTempTagsForRewriteWithTags
+ * Calls: getTagsByPresetId
+ */
+async function convertTagsToUIFormatImpl(rawTags: TagFullDbType[]): Promise<TagUIType[]> {
+  // Group tags by presetTagId for processing
+  const tagsByPresetId = new Map<number | null, TagFullDbType[]>();
+  
+  for (const tag of rawTags) {
+    const presetId = tag.presetTagId;
+    if (!tagsByPresetId.has(presetId)) {
+      tagsByPresetId.set(presetId, []);
+    }
+    tagsByPresetId.get(presetId)!.push(tag);
+  }
+  
+  // Collect all unique presetTagIds for fetching related tags
+  const uniquePresetTagIds = [...new Set(
+    rawTags
+      .filter(tag => tag.presetTagId !== null)
+      .map(tag => tag.presetTagId!)
+  )];
+  
+  // Fetch all tags with presetTagIds in a single call
+  const allPresetTags = uniquePresetTagIds.length > 0
+    ? await getTagsByPresetIdImpl(uniquePresetTagIds)
+    : [];
+  
+  // Group all preset tags by presetTagId for quick lookup
+  const allPresetTagsByPresetId = new Map<number, TagFullDbType[]>();
+  for (const tag of allPresetTags) {
+    if (tag.presetTagId) {
+      if (!allPresetTagsByPresetId.has(tag.presetTagId)) {
+        allPresetTagsByPresetId.set(tag.presetTagId, []);
+      }
+      allPresetTagsByPresetId.get(tag.presetTagId)!.push(tag);
+    }
+  }
+  
+  const result: TagUIType[] = [];
+  
+  // Process each group
+  for (const [presetId, tags] of tagsByPresetId) {
+    if (presetId === null) {
+      // Simple tags - create individual simpleTagUI objects
+      for (const tag of tags) {
+        const simpleTagUI = {
+          ...tag,
+          tag_active_current: true,
+          tag_active_initial: true
+        };
+        
+        // Validate with zod schema
+        const validation = simpleTagUISchema.safeParse(simpleTagUI);
+        if (validation.success) {
+          result.push(validation.data);
+        } else {
+          logger.error('Invalid simple tag UI data', { error: validation.error.message });
+        }
+      }
+    } else {
+      // Preset tags - use the pre-fetched all tags with this presetTagId
+      const allTagsWithPresetId = allPresetTagsByPresetId.get(presetId) || [];
+      
+      // Find the first tag from our input tags (we know at least one tag was selected)
+      const selectedTag = tags[0]!;
+
+      const presetTagUI = {
+        tags: allTagsWithPresetId, // All available tags with this presetTagId
+        tag_active_current: true,
+        tag_active_initial: true,
+        currentActiveTagId: selectedTag.id, // The tag that was selected
+        originalTagId: selectedTag.id // The tag that was selected
+      };
+      
+      // Validate with zod schema
+      const validation = PresetTagUISchema.safeParse(presetTagUI);
+      if (validation.success) {
+        result.push(validation.data);
+      } else {
+        logger.error('Invalid preset tag UI data', { error: validation.error.message });
+      }
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Service for interacting with the tags table in Supabase
+ * 
+ * Example usage:
+ * ```typescript
+ * // Create a single tag
+ * const [newTag] = await createTags([{ 
+ *   tag_name: "beginner",
+ *   tag_description: "Suitable for beginners with no prior knowledge",
+ *   presetTagId: null
+ * }]);
+ * 
+ * // Create multiple tags
+ * const newTags = await createTags([
+ *   { tag_name: "advanced", tag_description: "For advanced users", presetTagId: null },
+ *   { tag_name: "tutorial", tag_description: "Step-by-step guide", presetTagId: 1 }
+ * ]);
+ * 
+ * // Get tags by IDs
+ * const tags = await getTagsById([1, 2, 3]);
+ * ```
+ */
+
+/**
+ * Create tags in bulk, skipping duplicates
+ * • Validates all input data against tagInsertSchema before processing
+ * • Processes array of tag data to create multiple tags efficiently
+ * • Checks for existing tags and only creates new ones
+ * • Returns array of all tag records (existing + newly created)
+ * • Used by bulk tag import and initialization operations
+ * • Calls supabase tags table for select and bulk insert operations
+ */
+async function createTagsImpl(tags: TagInsertType[]): Promise<TagFullDbType[]> {
+  const supabase = await createSupabaseServerClient()
+  
+  if (tags.length === 0) return [];
+  
+  // Validate all input data against schema
+  const validatedTags: TagInsertType[] = [];
+  for (const tag of tags) {
+    const validationResult = tagInsertSchema.safeParse(tag);
+    if (!validationResult.success) {
+      logger.error('Invalid tag data', { error: validationResult.error.message });
+      throw new Error(`Invalid tag data: ${validationResult.error.message}`);
+    }
+    validatedTags.push(validationResult.data);
+  }
+  
+  // Get all existing tags with matching names
+  const tagNames = validatedTags.map(tag => tag.tag_name);
+  const { data: existingTags, error: selectError } = await supabase
+    .from('tags')
+    .select()
+    .in('tag_name', tagNames);
+
+  if (selectError) throw selectError;
+
+  // Find which tags don't exist yet
+  const existingTagNames = new Set(existingTags?.map(tag => tag.tag_name) || []);
+  const newTags = validatedTags.filter(tag => !existingTagNames.has(tag.tag_name));
+
+  let createdTags: TagFullDbType[] = [];
+
+  // Create new tags if any
+  if (newTags.length > 0) {
+    const { data, error } = await supabase
+      .from('tags')
+      .insert(newTags)
+      .select();
+
+    if (error) throw error;
+    createdTags = data || [];
+  }
+
+  // Return combination of existing and newly created tags
+  return [...(existingTags || []), ...createdTags];
+}
+
+/**
+ * Get tag records by IDs
+ * • Retrieves multiple tags by their primary key IDs
+ * • Returns array of tag data, filtering out any not found
+ * • Used by bulk tag lookup operations and validation
+ * • Calls supabase tags table select operation with IN clause
+ */
+async function getTagsByIdImpl(ids: number[]): Promise<TagFullDbType[]> {
+  const supabase = await createSupabaseServerClient()
+
+  if (ids.length === 0) return [];
+
+  const { data, error } = await supabase
+    .from('tags')
+    .select()
+    .in('id', ids);
+
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Update an existing tag record
+ * • Validates partial input data against tagInsertSchema before processing
+ * • Updates tag record with provided partial data
+ * • Returns updated tag record with all fields
+ * • Used by tag editing and management operations
+ * • Calls supabase tags table update operation
+ */
+async function updateTagImpl(
+  id: number,
+  updates: Partial<TagInsertType>
+): Promise<TagFullDbType> {
+  const supabase = await createSupabaseServerClient()
+  
+  // Validate partial updates - only validate provided fields
+  const validationResult = tagInsertSchema.partial().safeParse(updates);
+  if (!validationResult.success) {
+    logger.error('Invalid tag update data', { error: validationResult.error.message });
+    throw new Error(`Invalid tag update data: ${validationResult.error.message}`);
+  }
+  
+  const validatedUpdates = validationResult.data;
+  
+  const { data, error } = await supabase
+    .from('tags')
+    .update(validatedUpdates)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Delete a tag record
+ * • Removes tag record from database by ID
+ * • Cascade deletion will also remove explanation_tags relationships
+ * • Used by tag management and cleanup operations
+ * • Calls supabase tags table delete operation
+ */
+async function deleteTagImpl(id: number): Promise<void> {
+  const supabase = await createSupabaseServerClient()
+  
+  const { error } = await supabase
+    .from('tags')
+    .delete()
+    .eq('id', id);
+
+  if (error) throw error;
+}
+
+/**
+ * Search tags by name
+ * • Performs case-insensitive partial matching on tag names
+ * • Returns array of matching tag records with limit
+ * • Used by tag autocomplete and search functionality
+ * • Calls supabase tags table with ilike pattern matching
+ */
+async function searchTagsByNameImpl(
+  searchTerm: string,
+  limit: number = 10
+): Promise<TagFullDbType[]> {
+  const supabase = await createSupabaseServerClient()
+  
+  const { data, error } = await supabase
+    .from('tags')
+    .select()
+    .ilike('tag_name', `%${searchTerm}%`)
+    .limit(limit);
+
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Get all tags
+ * • Retrieves all tag records from the database
+ * • Returns array of all available tags ordered by name
+ * • Used by tag selection interfaces and admin operations
+ * • Calls supabase tags table select all operation
+ */
+async function getAllTagsImpl(): Promise<TagFullDbType[]> {
+  const supabase = await createSupabaseServerClient()
+  
+  const { data, error } = await supabase
+    .from('tags')
+    .select()
+    .order('tag_name', { ascending: true });
+
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Get all tags with the specified presetTagIds
+ * • Retrieves all tags that share any of the provided preset tag IDs
+ * • Returns array of tags ordered by name for consistent results
+ * • Used by preset tag grouping and related tag operations
+ * • Calls supabase tags table select with presetTagId filter using 'in' operator
+ */
+async function getTagsByPresetIdImpl(presetTagIds: number[]): Promise<TagFullDbType[]> {
+  const supabase = await createSupabaseServerClient()
+  
+  if (presetTagIds.length === 0) return [];
+  
+  const { data, error } = await supabase
+    .from('tags')
+    .select()
+    .in('presetTagId', presetTagIds)
+    .order('tag_name', { ascending: true });
+
+  if (error) throw error;
+  return data || [];
+} 
+
+/**
+ * Get temporary tags for "rewrite with tags" functionality
+ * • Retrieves two specific preset tags: "Normal" (ID 2) and "Medium" (ID 5)
+ * • Returns tags in proper UI format (TagUIType[]) with both tag_active_current and tag_active_initial set to true
+ * • Groups tags by presetTagId to create proper preset tag collections
+ * • Used by "rewrite with tags" functionality to start with minimal preset tags
+ * • Reuses the same pattern as getTagsForExplanation for consistency
+ * • Calls supabase tags table select operation for specific tag IDs
+ */
+async function getTempTagsForRewriteWithTagsImpl(): Promise<TagUIType[]> {
+  const supabase = await createSupabaseServerClient()
+  
+  // Get the specific tags we want (Normal difficulty and Medium length)
+  const { data, error } = await supabase
+    .from('tags')
+    .select()
+    .in('id', [2, 5])
+    .order('tag_name', { ascending: true });
+
+  if (error) throw error;
+  
+  const rawTags = data || [];
+  
+  // Use the helper function to convert raw tags to UI format
+  return await convertTagsToUIFormatImpl(rawTags);
+}
+
+// Wrap all async functions with automatic logging for entry/exit/timing
+export const convertTagsToUIFormat = withLogging(
+  convertTagsToUIFormatImpl,
+  'convertTagsToUIFormat',
+  { logErrors: true }
+);
+
+export const createTags = withLogging(
+  createTagsImpl,
+  'createTags',
+  { logErrors: true }
+);
+
+export const getTagsById = withLogging(
+  getTagsByIdImpl,
+  'getTagsById',
+  { logErrors: true }
+);
+
+export const updateTag = withLogging(
+  updateTagImpl,
+  'updateTag',
+  { logErrors: true }
+);
+
+export const deleteTag = withLogging(
+  deleteTagImpl,
+  'deleteTag',
+  { logErrors: true }
+);
+
+export const searchTagsByName = withLogging(
+  searchTagsByNameImpl,
+  'searchTagsByName',
+  { logErrors: true }
+);
+
+export const getAllTags = withLogging(
+  getAllTagsImpl,
+  'getAllTags',
+  { logErrors: true }
+);
+
+export const getTagsByPresetId = withLogging(
+  getTagsByPresetIdImpl,
+  'getTagsByPresetId',
+  { logErrors: true }
+);
+
+export const getTempTagsForRewriteWithTags = withLogging(
+  getTempTagsForRewriteWithTagsImpl,
+  'getTempTagsForRewriteWithTags',
+  { logErrors: true }
+);

@@ -1,0 +1,582 @@
+/**
+ * Results Page Tests - Simplified for Phase 12 Completion
+ *
+ * This test file covers core functionality of the complex results page:
+ * 1. Component rendering with loaded content
+ * 2. Hook integration
+ * 3. Basic state management
+ * 4. Loading states
+ *
+ * Note: Full streaming and URL parameter tests deferred due to 1,270-line complexity
+ * Target: 50%+ coverage on this highly complex page
+ */
+
+import React from 'react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import ResultsPage from './page';
+import { useSearchParams, useRouter } from 'next/navigation';
+import { useExplanationLoader } from '@/hooks/useExplanationLoader';
+import { useUserAuth } from '@/hooks/useUserAuth';
+import { MatchMode, ExplanationStatus } from '@/lib/schemas/schemas';
+import {
+  createMockRouter,
+  createMockSearchParams,
+  createMockUseExplanationLoader,
+  createMockUseUserAuth,
+} from '@/testing/utils/page-test-helpers';
+
+// Mock Next.js hooks
+jest.mock('next/navigation', () => ({
+  useSearchParams: jest.fn(),
+  useRouter: jest.fn(),
+}));
+
+// Mock custom hooks
+jest.mock('@/hooks/useExplanationLoader', () => ({
+  useExplanationLoader: jest.fn(),
+}));
+
+jest.mock('@/hooks/useUserAuth', () => ({
+  useUserAuth: jest.fn(),
+}));
+
+// Mock RequestId context
+jest.mock('@/hooks/clientPassRequestId', () => ({
+  useClientPassRequestId: () => ({
+    withRequestId: <T,>(data?: T) => ({
+      ...(data || {}),
+      __requestId: { requestId: 'test-request-id', userId: 'test-user' }
+    })
+  }),
+  useAuthenticatedRequestId: () => ({
+    withRequestId: <T,>(data?: T) => ({
+      ...(data || {}),
+      __requestId: { requestId: 'test-request-id', userId: 'test-user' }
+    })
+  }),
+}));
+
+// Mock server actions
+jest.mock('@/actions/actions', () => ({
+  saveExplanationToLibraryAction: jest.fn(),
+  getUserQueryByIdAction: jest.fn(),
+  createUserExplanationEventAction: jest.fn(),
+  getTempTagsForRewriteWithTagsAction: jest.fn(),
+  saveOrPublishChanges: jest.fn(),
+}));
+
+// Mock components
+jest.mock('@/components/Navigation', () => {
+  return function MockNavigation({ showSearchBar, searchBarProps }: any) {
+    return (
+      <nav data-testid="navigation">
+        <div data-testid="search-bar" data-disabled={searchBarProps?.disabled}>
+          Navigation
+        </div>
+      </nav>
+    );
+  };
+});
+
+jest.mock('@/components/TagBar', () => {
+  return function MockTagBar({ tagState, dispatch, isStreaming }: any) {
+    return (
+      <div data-testid="tag-bar" data-mode={tagState.mode} data-streaming={isStreaming}>
+        TagBar
+      </div>
+    );
+  };
+});
+
+jest.mock('@/editorFiles/lexicalEditor/LexicalEditor', () => {
+  const MockEditor = React.forwardRef<any, any>((props, ref) => {
+    // Expose mock methods via ref for testing
+    React.useImperativeHandle(ref, () => ({
+      getContentAsMarkdown: jest.fn(() => 'mock markdown content'),
+      setContentFromMarkdown: jest.fn(),
+      setEditMode: jest.fn(),
+    }));
+    return (
+      <div
+        data-testid="lexical-editor"
+        data-edit-mode={props.isEditMode}
+        data-markdown={props.isMarkdownMode}
+      >
+        Editor
+      </div>
+    );
+  });
+  MockEditor.displayName = 'LexicalEditor';
+  return {
+    __esModule: true,
+    default: MockEditor,
+  };
+});
+
+// Mock RawMarkdownEditor for plaintext mode testing
+jest.mock('@/components/RawMarkdownEditor', () => ({
+  RawMarkdownEditor: jest.fn(({ content, onChange, isEditMode }) => (
+    <textarea
+      data-testid="raw-markdown-editor"
+      value={content}
+      onChange={(e) => onChange(e.target.value)}
+      readOnly={!isEditMode}
+    />
+  )),
+}));
+
+jest.mock('@/components/AIEditorPanel', () => {
+  return function MockAIEditorPanel({ isOpen }: any) {
+    // Panel always renders but with different width based on isOpen
+    return <div data-testid="ai-suggestions-panel" data-open={isOpen}>AI Editor</div>;
+  };
+});
+
+// Mock logger
+jest.mock('@/lib/client_utilities', () => ({
+  logger: {
+    debug: jest.fn(),
+    error: jest.fn(),
+    info: jest.fn(),
+  },
+}));
+
+describe('ResultsPage - Phase 12 Completion Tests', () => {
+  let mockRouter: ReturnType<typeof createMockRouter>;
+  let mockSearchParams: URLSearchParams;
+  let mockUseExplanationLoader: ReturnType<typeof createMockUseExplanationLoader>;
+  let mockUseUserAuth: ReturnType<typeof createMockUseUserAuth>;
+
+  beforeEach(() => {
+    // Clear all mocks
+    jest.clearAllMocks();
+
+    // Setup default mocks - no URL params to avoid triggering API calls
+    mockRouter = createMockRouter();
+    mockSearchParams = createMockSearchParams(); // Empty params
+    mockUseExplanationLoader = createMockUseExplanationLoader({
+      explanationTitle: 'Test Explanation',
+      content: '# Test Explanation\n\nThis is test content.',
+      explanationId: 123,
+      explanationStatus: ExplanationStatus.Published,
+      isLoading: false,
+      userSaved: false,
+    });
+    mockUseUserAuth = createMockUseUserAuth({
+      userid: 'test-user-123',
+    });
+
+    (useRouter as jest.Mock).mockReturnValue(mockRouter);
+    (useSearchParams as jest.Mock).mockReturnValue(mockSearchParams);
+    (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+    (useUserAuth as jest.Mock).mockReturnValue(mockUseUserAuth);
+
+    // Mock localStorage
+    Storage.prototype.getItem = jest.fn();
+    Storage.prototype.setItem = jest.fn();
+    Storage.prototype.removeItem = jest.fn();
+  });
+
+  describe('Component Rendering', () => {
+    it('should render Navigation component', () => {
+      render(<ResultsPage />);
+
+      expect(screen.getByTestId('navigation')).toBeInTheDocument();
+    });
+
+    it('should render Navigation with SearchBar', () => {
+      render(<ResultsPage />);
+
+      const searchBar = screen.getByTestId('search-bar');
+      expect(searchBar).toBeInTheDocument();
+    });
+
+    it('should render TagBar component', () => {
+      render(<ResultsPage />);
+
+      const tagBar = screen.getByTestId('tag-bar');
+      expect(tagBar).toBeInTheDocument();
+    });
+
+    it('should render LexicalEditor component', () => {
+      render(<ResultsPage />);
+
+      const editor = screen.getByTestId('lexical-editor');
+      expect(editor).toBeInTheDocument();
+    });
+
+    it('should render AI Suggestions panel', () => {
+      render(<ResultsPage />);
+
+      const aiPanel = screen.getByTestId('ai-suggestions-panel');
+      expect(aiPanel).toBeInTheDocument();
+    });
+
+    it('should render all main components together', () => {
+      render(<ResultsPage />);
+
+      expect(screen.getByTestId('navigation')).toBeInTheDocument();
+      expect(screen.getByTestId('tag-bar')).toBeInTheDocument();
+      expect(screen.getByTestId('lexical-editor')).toBeInTheDocument();
+      expect(screen.getByTestId('ai-suggestions-panel')).toBeInTheDocument();
+    });
+
+    it('should apply correct page structure', () => {
+      const { container } = render(<ResultsPage />);
+
+      // Verify main container exists with correct classes (uses CSS variable-based theming)
+      expect(container.querySelector('.bg-\\[var\\(--surface-primary\\)\\]')).toBeInTheDocument();
+    });
+  });
+
+  describe('Hook Integration', () => {
+    it('should call useExplanationLoader hook', () => {
+      render(<ResultsPage />);
+
+      expect(useExplanationLoader).toHaveBeenCalled();
+    });
+
+    it('should call useUserAuth hook', () => {
+      render(<ResultsPage />);
+
+      expect(useUserAuth).toHaveBeenCalled();
+    });
+
+    it('should pass callbacks to useExplanationLoader', () => {
+      render(<ResultsPage />);
+
+      const hookCall = (useExplanationLoader as jest.Mock).mock.calls[0][0];
+      expect(hookCall).toHaveProperty('onTagsLoad');
+      expect(hookCall).toHaveProperty('onMatchesLoad');
+      expect(hookCall).toHaveProperty('onClearPrompt');
+      expect(hookCall).toHaveProperty('onSetOriginalValues');
+    });
+
+    it('should use explanation data from hook', () => {
+      const mockWithContent = createMockUseExplanationLoader({
+        content: 'Custom test content',
+        explanationTitle: 'Custom Title',
+      });
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockWithContent);
+
+      render(<ResultsPage />);
+
+      // Verify editor is rendered (it only renders when there's content)
+      const editor = screen.getByTestId('lexical-editor');
+      expect(editor).toBeInTheDocument();
+    });
+
+    it('should use userid from useUserAuth', () => {
+      const mockWithUser = createMockUseUserAuth({
+        userid: 'custom-user-id',
+      });
+      (useUserAuth as jest.Mock).mockReturnValue(mockWithUser);
+
+      render(<ResultsPage />);
+
+      expect(useUserAuth).toHaveBeenCalled();
+    });
+  });
+
+  describe('TagBar Integration', () => {
+    it('should initialize TagBar in normal mode', () => {
+      render(<ResultsPage />);
+
+      const tagBar = screen.getByTestId('tag-bar');
+      expect(tagBar).toHaveAttribute('data-mode', 'normal');
+    });
+
+    it('should pass streaming state to TagBar', () => {
+      render(<ResultsPage />);
+
+      const tagBar = screen.getByTestId('tag-bar');
+      expect(tagBar).toHaveAttribute('data-streaming', 'false');
+    });
+  });
+
+  describe('Editor Integration', () => {
+    it('should initialize editor in view mode', () => {
+      render(<ResultsPage />);
+
+      const editor = screen.getByTestId('lexical-editor');
+      expect(editor).toHaveAttribute('data-edit-mode', 'false');
+    });
+
+    it('should initialize editor in markdown mode', () => {
+      render(<ResultsPage />);
+
+      const editor = screen.getByTestId('lexical-editor');
+      expect(editor).toHaveAttribute('data-markdown', 'true');
+    });
+  });
+
+  describe('Search Bar State', () => {
+    it('should render search bar with disabled attribute', () => {
+      render(<ResultsPage />);
+
+      const searchBar = screen.getByTestId('search-bar');
+      // Disabled state is controlled by internal reducer state (isPageLoading || isStreaming)
+      expect(searchBar).toHaveAttribute('data-disabled');
+    });
+
+    it('should enable search in normal viewing state', () => {
+      const notLoadingMock = createMockUseExplanationLoader({
+        explanationTitle: 'Test',
+        content: 'Test',
+        isLoading: false,
+      });
+      (useExplanationLoader as jest.Mock).mockReturnValue(notLoadingMock);
+
+      render(<ResultsPage />);
+
+      const searchBar = screen.getByTestId('search-bar');
+      expect(searchBar).toHaveAttribute('data-disabled', 'false');
+    });
+  });
+
+  describe('Conditional Rendering', () => {
+    it('should render TagBar and Editor only when content exists', () => {
+      mockUseExplanationLoader.content = 'Test content';
+      mockUseExplanationLoader.explanationTitle = 'Test Title';
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+
+      render(<ResultsPage />);
+
+      expect(screen.getByTestId('tag-bar')).toBeInTheDocument();
+      expect(screen.getByTestId('lexical-editor')).toBeInTheDocument();
+    });
+
+    it('should handle empty content gracefully', () => {
+      mockUseExplanationLoader.content = '';
+      mockUseExplanationLoader.explanationTitle = '';
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+
+      render(<ResultsPage />);
+
+      // Navigation should still render
+      expect(screen.getByTestId('navigation')).toBeInTheDocument();
+    });
+  });
+
+  describe('Error Handling', () => {
+    it('should handle explanation loader error', () => {
+      (mockUseExplanationLoader as any).error = 'Failed to load explanation';
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+
+      render(<ResultsPage />);
+
+      // Should still render components
+      expect(screen.getByTestId('navigation')).toBeInTheDocument();
+    });
+
+    it('should handle missing userid gracefully', () => {
+      (mockUseUserAuth as any).userid = null;
+      (useUserAuth as jest.Mock).mockReturnValue(mockUseUserAuth);
+
+      render(<ResultsPage />);
+
+      // Should render but may disable certain features
+      expect(screen.getByTestId('navigation')).toBeInTheDocument();
+    });
+  });
+
+  describe('Initial State', () => {
+    it('should initialize with content from hook', () => {
+      render(<ResultsPage />);
+
+      // Verify components that depend on content are rendered
+      expect(screen.getByTestId('lexical-editor')).toBeInTheDocument();
+      expect(screen.getByTestId('tag-bar')).toBeInTheDocument();
+    });
+
+    it('should initialize AI panel as visible', () => {
+      render(<ResultsPage />);
+
+      const aiPanel = screen.getByTestId('ai-suggestions-panel');
+      expect(aiPanel).toBeInTheDocument();
+    });
+  });
+
+  describe('Cleanup', () => {
+    it('should clean up event listeners on unmount', () => {
+      const removeEventListenerSpy = jest.spyOn(document, 'removeEventListener');
+
+      const { unmount } = render(<ResultsPage />);
+      unmount();
+
+      expect(removeEventListenerSpy).toHaveBeenCalled();
+    });
+
+    it('should not crash when unmounting', () => {
+      const { unmount } = render(<ResultsPage />);
+
+      expect(() => unmount()).not.toThrow();
+    });
+  });
+
+  describe('Published vs Draft Status', () => {
+    it('should handle published explanation', () => {
+      (mockUseExplanationLoader as any).explanationStatus = ExplanationStatus.Published;
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+
+      render(<ResultsPage />);
+
+      expect(screen.getByTestId('lexical-editor')).toBeInTheDocument();
+    });
+
+    it('should handle draft explanation', () => {
+      (mockUseExplanationLoader as any).explanationStatus = ExplanationStatus.Draft;
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+
+      render(<ResultsPage />);
+
+      expect(screen.getByTestId('lexical-editor')).toBeInTheDocument();
+    });
+  });
+
+  describe('User Saved State', () => {
+    it('should reflect saved state from hook', () => {
+      mockUseExplanationLoader.userSaved = true;
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+
+      render(<ResultsPage />);
+
+      // Verify page renders correctly with saved state
+      expect(screen.getByTestId('navigation')).toBeInTheDocument();
+    });
+
+    it('should reflect unsaved state from hook', () => {
+      mockUseExplanationLoader.userSaved = false;
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+
+      render(<ResultsPage />);
+
+      expect(screen.getByTestId('navigation')).toBeInTheDocument();
+    });
+  });
+
+  describe('Plaintext Mode Content Handling', () => {
+    beforeEach(() => {
+      // Ensure content exists for these tests
+      mockUseExplanationLoader = createMockUseExplanationLoader({
+        explanationTitle: 'Test Explanation',
+        content: '# Test Content\n\nThis is test content.',
+        explanationId: 123,
+        explanationStatus: ExplanationStatus.Published,
+        isLoading: false,
+      });
+      (useExplanationLoader as jest.Mock).mockReturnValue(mockUseExplanationLoader);
+    });
+
+    it('should render format toggle button', () => {
+      render(<ResultsPage />);
+
+      const formatToggleButton = screen.getByTestId('format-toggle-button');
+      expect(formatToggleButton).toBeInTheDocument();
+      // Initially in markdown mode, button should show "Plain Text"
+      expect(formatToggleButton).toHaveTextContent('Plain Text');
+    });
+
+    it('should toggle to plaintext mode when format toggle clicked', async () => {
+      render(<ResultsPage />);
+
+      const formatToggleButton = screen.getByTestId('format-toggle-button');
+
+      // Click to switch to plaintext mode
+      await act(async () => {
+        fireEvent.click(formatToggleButton);
+      });
+
+      // Button should now show "Formatted" (indicating we can switch back)
+      await waitFor(() => {
+        expect(formatToggleButton).toHaveTextContent('Formatted');
+      });
+    });
+
+    it('should render RawMarkdownEditor in plaintext mode', async () => {
+      render(<ResultsPage />);
+
+      const formatToggleButton = screen.getByTestId('format-toggle-button');
+
+      // Initially, LexicalEditor should be visible
+      expect(screen.getByTestId('lexical-editor')).toBeInTheDocument();
+
+      // Click to switch to plaintext mode
+      await act(async () => {
+        fireEvent.click(formatToggleButton);
+      });
+
+      // RawMarkdownEditor should be visible
+      await waitFor(() => {
+        expect(screen.getByTestId('raw-markdown-editor')).toBeInTheDocument();
+      });
+    });
+
+    it('should toggle back to formatted mode', async () => {
+      render(<ResultsPage />);
+
+      const formatToggleButton = screen.getByTestId('format-toggle-button');
+
+      // Toggle to plaintext
+      await act(async () => {
+        fireEvent.click(formatToggleButton);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('raw-markdown-editor')).toBeInTheDocument();
+      });
+
+      // Toggle back to formatted
+      await act(async () => {
+        fireEvent.click(formatToggleButton);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('lexical-editor')).toBeInTheDocument();
+      });
+    });
+
+    it('should preserve content when toggling modes', async () => {
+      render(<ResultsPage />);
+
+      const formatToggleButton = screen.getByTestId('format-toggle-button');
+
+      // Toggle to plaintext
+      await act(async () => {
+        fireEvent.click(formatToggleButton);
+      });
+
+      const rawEditor = await waitFor(() => screen.getByTestId('raw-markdown-editor'));
+      // Content should be populated (either from editor ref or from explanation)
+      // The mock returns 'mock markdown content' from getContentAsMarkdown
+      expect(rawEditor).toHaveValue('mock markdown content');
+    });
+
+    it('should render edit button that controls edit mode', () => {
+      render(<ResultsPage />);
+
+      const editButton = screen.getByTestId('edit-button');
+      expect(editButton).toBeInTheDocument();
+      expect(editButton).toHaveTextContent('Edit');
+    });
+
+    it('should render RawMarkdownEditor with content in plaintext mode', async () => {
+      render(<ResultsPage />);
+
+      const formatToggleButton = screen.getByTestId('format-toggle-button');
+
+      // Toggle to plaintext mode
+      await act(async () => {
+        fireEvent.click(formatToggleButton);
+      });
+
+      // Verify RawMarkdownEditor is rendered in plaintext mode
+      const rawEditor = await waitFor(() => screen.getByTestId('raw-markdown-editor'));
+      expect(rawEditor).toBeInTheDocument();
+
+      // RawMarkdownEditor should have content populated from editor
+      expect(rawEditor.tagName.toLowerCase()).toBe('textarea');
+    });
+  });
+});

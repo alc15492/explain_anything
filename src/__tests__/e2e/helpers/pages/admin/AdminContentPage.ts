@@ -1,0 +1,236 @@
+/**
+ * Page object for admin content management page.
+ * Provides locators and actions for explanation table and detail modal.
+ */
+
+import { Page, Locator, expect } from '@playwright/test';
+import { AdminBasePage } from './AdminBasePage';
+
+export class AdminContentPage extends AdminBasePage {
+  // Table elements
+  readonly searchInput: Locator;
+  readonly statusFilter: Locator;
+  readonly showHiddenCheckbox: Locator;
+  readonly filterTestContentCheckbox: Locator;
+  readonly bulkHideButton: Locator;
+  readonly table: Locator;
+  readonly selectAllCheckbox: Locator;
+  readonly pagination: Locator;
+  readonly prevPageButton: Locator;
+  readonly nextPageButton: Locator;
+
+  // Modal elements
+  readonly detailModal: Locator;
+  readonly modalCloseButton: Locator;
+  readonly modalCloseFooter: Locator;
+  readonly modalViewPublic: Locator;
+  readonly modalHideButton: Locator;
+  readonly modalRestoreButton: Locator;
+
+  constructor(page: Page) {
+    super(page);
+
+    // Table elements
+    this.searchInput = page.getByTestId('admin-content-search');
+    this.statusFilter = page.getByTestId('admin-content-status-filter');
+    this.showHiddenCheckbox = page.getByTestId('admin-content-show-hidden');
+    this.filterTestContentCheckbox = page.getByTestId('admin-content-filter-test-content');
+    this.bulkHideButton = page.getByTestId('admin-content-bulk-hide');
+    this.table = page.getByTestId('admin-content-table');
+    this.selectAllCheckbox = page.getByTestId('admin-content-select-all');
+    this.pagination = page.getByTestId('admin-content-pagination');
+    this.prevPageButton = page.getByTestId('admin-content-prev-page');
+    this.nextPageButton = page.getByTestId('admin-content-next-page');
+
+    // Modal elements
+    this.detailModal = page.getByTestId('admin-content-detail-modal');
+    this.modalCloseButton = page.getByTestId('admin-content-detail-close');
+    this.modalCloseFooter = page.getByTestId('admin-content-detail-close-footer');
+    this.modalViewPublic = page.getByTestId('admin-content-detail-view-public');
+    this.modalHideButton = page.getByTestId('admin-content-detail-hide');
+    this.modalRestoreButton = page.getByTestId('admin-content-detail-restore');
+  }
+
+  /**
+   * Navigate to the content management page.
+   * Waits for the initial data load to complete before returning so callers
+   * can immediately interact with filters without racing the first fetch.
+   */
+  async gotoContent() {
+    // Navigate directly to content page (avoids hydration race with dashboard nav click)
+    await this.page.goto('/admin/content', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await this.table.waitFor({ state: 'visible', timeout: 30000 });
+    // Wait for initial data load to finish (avoids race with concurrent filter-triggered fetch)
+    await expect(this.table.locator('tbody')).not.toContainText('Loading...', { timeout: 30000 });
+  }
+
+  /**
+   * Verify the content page has loaded.
+   */
+  async expectContentPageLoaded() {
+    await expect(this.table).toBeVisible();
+    await expect(this.searchInput).toBeVisible();
+    await expect(this.statusFilter).toBeVisible();
+  }
+
+  /**
+   * Get a row locator by explanation ID.
+   */
+  getRow(id: number): Locator {
+    return this.page.getByTestId(`admin-content-row-${id}`);
+  }
+
+  /**
+   * Get a checkbox locator by explanation ID.
+   */
+  getCheckbox(id: number): Locator {
+    return this.page.getByTestId(`admin-content-checkbox-${id}`);
+  }
+
+  /**
+   * Get a title button locator by explanation ID.
+   */
+  getTitleButton(id: number): Locator {
+    return this.page.getByTestId(`admin-content-title-${id}`);
+  }
+
+  /**
+   * Get a view button locator by explanation ID.
+   */
+  getViewButton(id: number): Locator {
+    return this.page.getByTestId(`admin-content-view-${id}`);
+  }
+
+  /**
+   * Get a hide button locator by explanation ID.
+   */
+  getHideButton(id: number): Locator {
+    return this.page.getByTestId(`admin-content-hide-${id}`);
+  }
+
+  /**
+   * Get a restore button locator by explanation ID.
+   */
+  getRestoreButton(id: number): Locator {
+    return this.page.getByTestId(`admin-content-restore-${id}`);
+  }
+
+  /**
+   * Search for explanations.
+   */
+  async search(query: string) {
+    await this.searchInput.fill(query);
+    // Wait for debounced search to trigger and table to update
+    await this.table.locator('tbody').waitFor({ state: 'visible' });
+    await expect(this.table.locator('tbody')).not.toContainText('Loading...');
+  }
+
+  /**
+   * Filter by status.
+   * Waits for the select value to update and for the reload to complete.
+   */
+  async filterByStatus(status: 'draft' | 'published' | '') {
+    await this.statusFilter.selectOption(status);
+    // Confirm select value changed (ensures React onChange fired)
+    await expect(this.statusFilter).toHaveValue(status, { timeout: 5000 });
+    // Wait for table data to finish loading (not.toContainText passes immediately if never loading)
+    await expect(this.table.locator('tbody')).not.toContainText('Loading...', { timeout: 15000 });
+  }
+
+  /**
+   * Toggle show hidden checkbox. (Existing helper kept for backwards compat
+   * with tests that legitimately want to toggle.)
+   */
+  async toggleShowHidden() {
+    await this.showHiddenCheckbox.click();
+    await expect(this.table.locator('tbody')).not.toContainText('Loading...');
+  }
+
+  /**
+   * Reset the admin-content page's default filter state to a known baseline.
+   * Uses Playwright's auto-waiting idempotent setChecked(false) — safe to
+   * call regardless of current checkbox state. See testing_overview.md Rule 1.
+   *
+   * NOTE: uses setChecked() not isChecked()-then-uncheck() to avoid the
+   * existing flakiness/no-point-in-time-checks lint rule, which flags
+   * `if (await checkbox.isChecked())` patterns.
+   */
+  async resetFilters(): Promise<void> {
+    await this.filterTestContentCheckbox.setChecked(false);
+  }
+
+  /**
+   * Enable "Show hidden" so hidden rows are visible in the table. Idempotent
+   * via setChecked(true). Use when a test specifically needs to see hidden
+   * content (e.g., after hiding then verifying); resetFilters() does NOT
+   * enable this by default to avoid surprising tests that don't want it.
+   */
+  async enableShowHidden(): Promise<void> {
+    await this.showHiddenCheckbox.setChecked(true);
+    await expect(this.table.locator('tbody')).not.toContainText('Loading...');
+  }
+
+  /**
+   * Open explanation detail modal.
+   */
+  async openDetailModal(id: number) {
+    await this.getTitleButton(id).click();
+    await expect(this.detailModal).toBeVisible();
+  }
+
+  /**
+   * Close the detail modal.
+   */
+  async closeDetailModal() {
+    await this.modalCloseButton.click();
+    await expect(this.detailModal).not.toBeVisible();
+  }
+
+  /**
+   * Hide explanation from detail modal.
+   * Clicks the Hide button, confirms in the ConfirmDialog, then waits for the modal to close.
+   * FocusTrap is configured with allowOutsideClick:true so the Radix portal ConfirmDialog
+   * receives click events normally.
+   */
+  async hideFromModal() {
+    await this.modalHideButton.click();
+    // The Hide button opens a ConfirmDialog — confirm it
+    const confirmDialog = this.page.getByRole('dialog').filter({ hasText: 'Hide Explanation?' });
+    await expect(confirmDialog).toBeVisible({ timeout: 5000 });
+    await confirmDialog.getByRole('button', { name: /^Hide$/i }).click();
+    await expect(this.detailModal).not.toBeVisible({ timeout: 10000 });
+  }
+
+  /**
+   * Restore explanation from detail modal.
+   * Clicks the Restore button, confirms in the ConfirmDialog, then waits for the modal to close.
+   */
+  async restoreFromModal() {
+    await this.modalRestoreButton.click();
+    // The Restore button opens a ConfirmDialog — confirm it
+    const confirmDialog = this.page.getByRole('dialog').filter({ hasText: 'Restore Explanation?' });
+    await expect(confirmDialog).toBeVisible({ timeout: 5000 });
+    await confirmDialog.getByRole('button', { name: /^Restore$/i }).click();
+    await expect(this.detailModal).not.toBeVisible({ timeout: 10000 });
+  }
+
+  /**
+   * Select multiple explanations.
+   */
+  async selectExplanations(ids: number[]) {
+    for (const id of ids) {
+      const checkbox = this.getCheckbox(id);
+      await checkbox.click();
+      // Wait for checkbox state change before clicking next
+      await expect(checkbox).toBeChecked({ timeout: 3000 });
+    }
+  }
+
+  /**
+   * Bulk hide selected explanations.
+   */
+  async bulkHide() {
+    await this.bulkHideButton.click();
+    await expect(this.table.locator('tbody')).not.toContainText('Loading...');
+  }
+}

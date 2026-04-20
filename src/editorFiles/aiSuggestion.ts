@@ -1,0 +1,718 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import React from 'react';
+import { z } from 'zod';
+import { DEFAULT_MODEL, ANONYMOUS_USER_UUID } from '@/lib/services/llms';
+import type { LexicalEditorRef } from '@/editorFiles/lexicalEditor/LexicalEditor';
+import { validateStep2Output, validateCriticMarkup, PipelineValidationResults, VALIDATION_DESCRIPTIONS } from './validation/pipelineValidation';
+import type { SourceForPromptType, SourceChipType } from '@/lib/schemas/schemas';
+
+/**
+ * Schema for AI suggestion structured output
+ * 
+ * • Enforces alternating pattern: either "... existing text ..." or actual edit content
+ * • Validates that edits and existing text markers alternate properly
+ * • Ensures the output starts and ends with content (not markers)
+ * • Used by: AI suggestion generation to enforce consistent output format
+ * • Calls: N/A (validation schema)
+ */
+export const aiSuggestionSchema = z.object({
+  // N: Add minimum length check for content segments to prevent empty strings
+  edits: z.array(z.string().min(1, 'Edit segments cannot be empty')).min(1).refine(
+    (edits) => {
+      // Must alternate between content and markers
+      for (let i = 0; i < edits.length; i++) {
+        const isMarker = edits[i] === "... existing text ...";
+        const isEvenIndex = i % 2 === 0;
+
+        // Even indices (0, 2, 4...) should be content
+        // Odd indices (1, 3, 5...) should be markers
+        if (isEvenIndex && isMarker) {
+          return false;
+        }
+        if (!isEvenIndex && !isMarker) {
+          return false;
+        }
+      }
+
+      return true;
+    },
+    {
+      message: "Edits must alternate between content and '... existing text ...' markers"
+    }
+  )
+});
+
+export type AISuggestionOutput = z.infer<typeof aiSuggestionSchema>;
+
+/**
+ * Formats sources for inclusion in AI suggestion prompts
+ * Creates a formatted string section listing all sources with their content
+ *
+ * @param sources - Array of sources to format for the prompt
+ * @returns Formatted sources section string, or empty string if no sources
+ */
+function formatSourcesSection(sources?: SourceForPromptType[]): string {
+  if (!sources || sources.length === 0) {
+    return '';
+  }
+
+  const sourcesContent = sources.map(s =>
+    `[Source ${s.index}] ${s.title} (${s.domain}) [${s.isVerbatim ? 'VERBATIM' : 'SUMMARIZED'}]
+---
+${s.content}
+---`
+  ).join('\n\n');
+
+  return `
+## Reference Sources
+${sourcesContent}
+
+Use these sources to inform your edits. Cite with [n] notation where appropriate.
+`;
+}
+
+/**
+ * Creates a structured prompt for AI suggestions
+ *
+ * • Generates prompt that enforces structured output format
+ * • Uses Zod schema to validate alternating edit/content pattern
+ * • Ensures consistent formatting for AI model responses
+ * • Optionally includes source content for informed editing
+ * • Used by: AI suggestion generation with structured output validation
+ * • Calls: N/A (prompt generation only)
+ */
+export function createAISuggestionPrompt(
+  currentText: string,
+  userPrompt: string,
+  sources?: SourceForPromptType[]
+): string {
+  const sourcesSection = formatSourcesSection(sources);
+
+  return `Apply the following edit instruction to the article below:
+"${userPrompt}"
+
+Only make edits relevant to this instruction. Do not make other improvements.
+${sourcesSection}
+<output_format>
+You must respond with a JSON object containing an "edits" array.
+The edits array will explain how to make described edits sequentially starting from beginning of content, while skipping unchanged "existing text"
+
+Each element in the array must be either:
+1. "... existing text ..." (to indicate unchanged content)
+2. The actual edited text content
+
+Example:
+{
+  "edits": [
+    "Improved introduction paragraph here",
+    "... existing text ...",
+    "Enhanced middle section with better examples"
+  ]
+}
+
+Or ending with marker:
+{
+  "edits": [
+    "This improved introduction paragraph has been revised for better wording",
+    "... existing text ...",
+    "This middle paragraph text has now been edited for clarity",
+    "... existing text ..."
+  ]
+}
+</output_format>
+
+<rules>
+- You can start with either edited content or "... existing text ..." marker
+- Alternate between content and "... existing text ..." markers
+- You can end with either edited content or "... existing text ..." marker
+- Preserve markdown formatting in your edits
+- Only make edits that fulfill the user's instruction above
+- Each edit should be a complete, coherent section
+- CRITICAL: Each edit MUST include surrounding context from original:
+  1. The last sentence BEFORE your edit (from original) - as anchor
+  2. Your actual edited content
+  3. The first sentence AFTER your edit (from original) - as anchor
+- Skip before-anchor if editing at start, skip after-anchor if editing at end${sources && sources.length > 0 ? '\n- When using information from sources, cite with [n] notation' : ''}
+</rules>
+
+== Article to edit ==:
+${currentText}`;
+}
+
+/**
+ * Converts UI-layer sources (SourceChipType) to prompt-layer format (SourceForPromptType)
+ * Fetches content via getOrCreateCachedSource which handles caching and summarization
+ *
+ * • Filters out sources with non-success status
+ * • Fetches source content from cache or source URL
+ * • Handles fetch errors gracefully, continuing with other sources
+ * • Used by: AI editor panel to prepare sources for pipeline
+ * • Calls: getOrCreateCachedSource from sourceCache
+ */
+export async function formatSourcesForPrompt(
+  sources: SourceChipType[],
+  userid: string
+): Promise<SourceForPromptType[]> {
+  const { getOrCreateCachedSource } = await import('@/lib/services/sourceCache');
+
+  const formatted: SourceForPromptType[] = [];
+
+  for (let i = 0; i < sources.length; i++) {
+    const source = sources[i]!;
+    // Skip sources that aren't successfully loaded
+    if (source.status !== 'success') continue;
+
+    try {
+      const result = await getOrCreateCachedSource(source.url, userid);
+      if (!result.source?.extracted_text) continue;
+
+      formatted.push({
+        index: i + 1,
+        title: result.source.title || source.domain,
+        domain: source.domain,
+        content: result.source.extracted_text,
+        isVerbatim: !result.source.is_summarized,
+      });
+    } catch (error) {
+      console.warn('Failed to fetch source for prompt', { url: source.url, error });
+      // Continue with other sources - don't fail the whole operation
+    }
+  }
+
+  return formatted;
+}
+
+/**
+ * Merges AI suggestion output array into a single string
+ * 
+ * • Combines alternating content and markers into readable format
+ * • Each array element starts on a newline for clarity
+ * • Preserves the structure of edits vs unchanged content
+ * • Used by: AI suggestion processing to convert structured output to readable text
+ * • Calls: N/A (string manipulation only)
+ */
+export function mergeAISuggestionOutput(output: AISuggestionOutput): string {
+  return output.edits.join('\n');
+}
+
+/**
+ * Validates AI suggestion output against schema
+ * 
+ * • Ensures output follows alternating pattern requirements
+ * • Validates structure before processing
+ * • Returns typed result or validation errors
+ * • Used by: AI suggestion processing to ensure output quality
+ * • Calls: aiSuggestionSchema.safeParse
+ */
+export function validateAISuggestionOutput(rawOutput: string): { success: true; data: AISuggestionOutput } | { success: false; error: z.ZodError } {
+  try {
+    const parsed = JSON.parse(rawOutput);
+    const result = aiSuggestionSchema.safeParse(parsed);
+    
+    if (result.success) {
+      return { success: true, data: result.data };
+    } else {
+      return { success: false, error: result.error };
+    }
+  } catch {
+    // If JSON parsing fails, create a mock ZodError
+    const mockError = new z.ZodError([
+      {
+        code: 'custom',
+        message: 'Invalid JSON format',
+        path: []
+      }
+    ]);
+    return { success: false, error: mockError };
+  }
+}
+
+// K: Safe AST parsing with fallback
+interface SafeParseResult {
+   
+  ast: any;
+  issues: string[];
+}
+
+/**
+ * K: Safely parses markdown content with error handling
+ *
+ * Wraps remark parse calls in try-catch to prevent crashes from malformed markdown
+ */
+ 
+export async function safeParseMarkdown(content: string): Promise<SafeParseResult> {
+  const { unified } = await import('unified');
+  const { default: remarkParse } = await import('remark-parse');
+
+  try {
+    const ast = unified().use(remarkParse).parse(content);
+    return { ast, issues: [] };
+  } catch (e) {
+    console.warn('⚠️ Markdown parse error, using fallback:', e);
+    // Create a minimal fallback AST with the content as a single paragraph
+    const fallbackAst = {
+      type: 'root',
+      children: [
+        {
+          type: 'paragraph',
+          children: [
+            {
+              type: 'text',
+              value: content
+            }
+          ]
+        }
+      ]
+    };
+    return {
+      ast: fallbackAst,
+      issues: [`Parse error: ${e instanceof Error ? e.message : String(e)}`]
+    };
+  }
+}
+
+// E1: Pipeline timeout configuration
+const PIPELINE_TIMEOUT_MS = 90000; // 90 seconds
+
+/**
+ * E1: Creates a timeout error for pipeline operations
+ */
+function createTimeoutError(operation: string): Error {
+  return new Error(`Pipeline timeout: ${operation} exceeded ${PIPELINE_TIMEOUT_MS / 1000}s limit`);
+}
+
+export function createApplyEditsPrompt(aiSuggestions: string, originalContent: string): string {
+    const applyPrompt = `You are an edit application tool. Your job is to take the suggested edits and apply them to the original content.
+
+You will receive:
+1. AI suggestions that use the format "... existing text ..." to mark unchanged sections
+2. The original content that needs to be edited
+
+Your task is to:
+1. Parse the AI suggestions to understand what edits to make
+2. Apply those edits to the original content
+3. Return the COMPLETE final text with all edits applied
+
+IMPORTANT RULES:
+- Return ONLY the final edited text, nothing else
+- Do not include the "... existing text ..." markers in your output
+- Preserve all formatting, spacing, and structure from the original
+- Make sure the final text is complete and readable
+- Each edit includes anchor sentences from original. Use them to locate where to apply the edit
+- The anchor sentences should remain unchanged - only modify the content between anchors
+
+== AI SUGGESTIONS ==
+${aiSuggestions}
+
+== ORIGINAL CONTENT ==
+${originalContent}
+
+== YOUR TASK ==
+Apply the AI suggestions to the original content and return the complete final text.`;
+
+    return applyPrompt;
+}
+
+/**
+ * Functional pipeline for running the complete AI suggestions workflow
+ *
+ * • Runs the 4-step AI suggestion pipeline sequentially
+ * • Each step must succeed for the next to proceed
+ * • Optionally includes source content for informed editing
+ * • Optionally saves session data to database when session_id is provided
+ * • Returns final preprocessed content ready for editor
+ * • Used by: getAndApplyAISuggestions for complete workflow
+ * • Calls: generateAISuggestionsAction, applyAISuggestionsAction, generateMarkdownASTDiff, preprocessCriticMarkup
+ */
+export async function runAISuggestionsPipeline(
+  currentContent: string,
+  userId: string,
+  onProgress?: (step: string, progress: number) => void,
+  sessionData?: {
+    session_id?: string;
+    explanation_id: number;
+    explanation_title: string;
+    user_prompt: string;
+    sources?: SourceForPromptType[];
+  }
+): Promise<{ content: string; session_id?: string; validationResults: PipelineValidationResults }> {
+  // Initialize validation results collector
+  const validationResults: PipelineValidationResults = {};
+
+  console.log('🚀 PIPELINE START: runAISuggestionsPipeline called', {
+    contentLength: currentContent.length,
+    userId,
+    hasSessionData: !!sessionData,
+    sessionData
+  });
+
+  // E1: Pipeline-level timeout with AbortController
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, PIPELINE_TIMEOUT_MS);
+
+  try {
+    // Check if already aborted
+    if (controller.signal.aborted) {
+      throw createTimeoutError('pipeline initialization');
+    }
+
+    onProgress?.('Generating AI suggestions...', 25);
+
+    // Import the server actions and utilities
+    // Note: Using type assertion because dynamic imports don't infer updated function signatures
+  const actionsModule = await import('../actions/actions');
+  const generateAISuggestionsAction = actionsModule.generateAISuggestionsAction as (
+    currentText: string,
+    userid: string,
+    userPrompt: string,
+    sources?: SourceForPromptType[]
+  ) => Promise<{ success: boolean; data: string | null; error: import('@/lib/errorHandling').ErrorResponse | null }>;
+  const { applyAISuggestionsAction, saveTestingPipelineStepAction } = actionsModule;
+  const { RenderCriticMarkupFromMDAstDiff } = await import('./markdownASTdiff/markdownASTdiff');
+  const { preprocessCriticMarkup } = await import('./lexicalEditor/importExportUtils');
+  // K: unified and remarkParse are now imported inside safeParseMarkdown
+
+  console.log('📦 PIPELINE: Imports loaded successfully');
+
+  console.log('🤖 PIPELINE STEP 1: Generating AI suggestions...');
+  const suggestionsResult = await generateAISuggestionsAction(currentContent, userId, sessionData?.user_prompt ?? '', sessionData?.sources);
+  console.log('🤖 PIPELINE STEP 1 RESULT:', {
+    success: suggestionsResult.success,
+    hasData: !!suggestionsResult.data,
+    dataLength: suggestionsResult.data?.length || 0,
+    error: suggestionsResult.error
+  });
+
+  if (!suggestionsResult.success || !suggestionsResult.data) {
+    console.error('❌ PIPELINE STEP 1 FAILED:', suggestionsResult.error);
+    // Include error code and details for better debugging
+    const errorCode = suggestionsResult.error?.code || 'UNKNOWN';
+    const errorMessage = suggestionsResult.error?.message || 'Failed to generate AI suggestions';
+    const errorDetails = suggestionsResult.error?.details ? ` (${JSON.stringify(suggestionsResult.error.details)})` : '';
+    throw new Error(`[${errorCode}] ${errorMessage}${errorDetails}`);
+  }
+  const suggestions = suggestionsResult.data;
+
+  // Save step 1 if session data provided
+  if (sessionData && sessionData.session_id) {
+    console.log('💾 PIPELINE: Saving step 1 to database...', {
+      sessionId: sessionData.session_id,
+      explanationId: sessionData.explanation_id,
+      contentLength: suggestions.length
+    });
+
+    try {
+      const saveResult = await saveTestingPipelineStepAction(
+        'ai-suggestion-session',
+        'step1_ai_suggestions',
+        suggestions,
+        {
+          session_id: sessionData.session_id,
+          explanation_id: sessionData.explanation_id,
+          explanation_title: sessionData.explanation_title,
+          user_prompt: sessionData.user_prompt,
+          source_content: currentContent,
+          session_metadata: { step: 'ai_suggestions', processing_time: Date.now() }
+        }
+      );
+      console.log('💾 PIPELINE STEP 1 SAVE RESULT:', saveResult);
+    } catch (error) {
+      console.error('❌ PIPELINE STEP 1 SAVE FAILED:', error);
+    }
+  } else {
+    console.log('⚠️ PIPELINE: No session data provided or missing session_id, skipping step 1 save');
+  }
+
+  onProgress?.('Applying suggestions...', 50);
+  console.log('✏️ PIPELINE STEP 2: Applying suggestions...');
+  const editedContentResult = await applyAISuggestionsAction(suggestions, currentContent, userId);
+  console.log('✏️ PIPELINE STEP 2 RESULT:', {
+    success: editedContentResult.success,
+    hasData: !!editedContentResult.data,
+    dataLength: editedContentResult.data?.length || 0,
+    error: editedContentResult.error
+  });
+
+  if (!editedContentResult.success || !editedContentResult.data) {
+    console.error('❌ PIPELINE STEP 2 FAILED:', editedContentResult.error);
+    // Include error code and details for better debugging
+    const errorCode = editedContentResult.error?.code || 'UNKNOWN';
+    const errorMessage = editedContentResult.error?.message || 'Failed to apply AI suggestions';
+    const errorDetails = editedContentResult.error?.details ? ` (${JSON.stringify(editedContentResult.error.details)})` : '';
+    throw new Error(`[${errorCode}] ${errorMessage}${errorDetails}`);
+  }
+  const editedContent = editedContentResult.data;
+
+  // B2: Validate Step 2 output for content preservation
+  const step2Validation = validateStep2Output(currentContent, editedContent);
+  validationResults.step2 = {
+    ...step2Validation,
+    description: VALIDATION_DESCRIPTIONS.step2,
+  };
+  if (!step2Validation.valid) {
+    console.warn('⚠️ PIPELINE STEP 2 VALIDATION ISSUES:', step2Validation.issues);
+    if (step2Validation.severity === 'error') {
+      throw new Error(`Step 2 validation failed: ${step2Validation.issues.join(', ')}`);
+    }
+  }
+
+  // Save step 2 if session data provided
+  if (sessionData && sessionData.session_id) {
+    console.log('💾 PIPELINE: Saving step 2 to database...');
+    try {
+      const saveResult = await saveTestingPipelineStepAction(
+        'ai-suggestion-session',
+        'step2_applied_edits',
+        editedContent,
+        {
+          session_id: sessionData.session_id,
+          explanation_id: sessionData.explanation_id,
+          explanation_title: sessionData.explanation_title,
+          user_prompt: sessionData.user_prompt,
+          source_content: currentContent,
+          session_metadata: { step: 'applied_edits', processing_time: Date.now() }
+        }
+      );
+      console.log('💾 PIPELINE STEP 2 SAVE RESULT:', saveResult);
+    } catch (error) {
+      console.error('❌ PIPELINE STEP 2 SAVE FAILED:', error);
+    }
+  }
+
+  onProgress?.('Generating diff...', 75);
+  console.log('🔄 PIPELINE STEP 3: Generating diff...');
+  // Generate AST diff and convert to CriticMarkup
+  // K: Use safe parse with fallback for malformed markdown
+  const beforeParsed = await safeParseMarkdown(currentContent);
+  const afterParsed = await safeParseMarkdown(editedContent);
+
+  if (beforeParsed.issues.length > 0) {
+    console.warn('⚠️ PIPELINE STEP 3: Before content parse issues:', beforeParsed.issues);
+  }
+  if (afterParsed.issues.length > 0) {
+    console.warn('⚠️ PIPELINE STEP 3: After content parse issues:', afterParsed.issues);
+  }
+
+  const criticMarkup = RenderCriticMarkupFromMDAstDiff(beforeParsed.ast, afterParsed.ast);
+  console.log('🔄 PIPELINE STEP 3 RESULT:', {
+    criticMarkupLength: criticMarkup.length,
+    hasCriticMarkup: criticMarkup.length > 0
+  });
+
+  // B3: Validate CriticMarkup syntax for balanced markers
+  const step3Validation = validateCriticMarkup(criticMarkup);
+  validationResults.step3 = {
+    ...step3Validation,
+    description: VALIDATION_DESCRIPTIONS.step3,
+  };
+  if (!step3Validation.valid) {
+    console.warn('⚠️ PIPELINE STEP 3 VALIDATION ISSUES:', step3Validation.issues);
+    // Log warning but don't throw - try to continue with potentially malformed markup
+  }
+
+  // Save step 3 if session data provided
+  if (sessionData && sessionData.session_id) {
+    console.log('💾 PIPELINE: Saving step 3 to database...');
+    try {
+      const saveResult = await saveTestingPipelineStepAction(
+        'ai-suggestion-session',
+        'step3_critic_markup',
+        criticMarkup,
+        {
+          session_id: sessionData.session_id,
+          explanation_id: sessionData.explanation_id,
+          explanation_title: sessionData.explanation_title,
+          user_prompt: sessionData.user_prompt,
+          source_content: currentContent,
+          session_metadata: { step: 'critic_markup', processing_time: Date.now() }
+        }
+      );
+      console.log('💾 PIPELINE STEP 3 SAVE RESULT:', saveResult);
+    } catch (error) {
+      console.error('❌ PIPELINE STEP 3 SAVE FAILED:', error);
+    }
+  }
+
+  onProgress?.('Preprocessing content...', 90);
+  console.log('🔧 PIPELINE STEP 4: Preprocessing content...');
+  const preprocessed = preprocessCriticMarkup(criticMarkup);
+  console.log('🔧 PIPELINE STEP 4 RESULT:', {
+    preprocessedLength: preprocessed.length,
+    hasPreprocessed: preprocessed.length > 0
+  });
+
+  // Save step 4 if session data provided
+  if (sessionData && sessionData.session_id) {
+    console.log('💾 PIPELINE: Saving step 4 to database...');
+    try {
+      const saveResult = await saveTestingPipelineStepAction(
+        'ai-suggestion-session',
+        'step4_preprocessed',
+        preprocessed,
+        {
+          session_id: sessionData.session_id,
+          explanation_id: sessionData.explanation_id,
+          explanation_title: sessionData.explanation_title,
+          user_prompt: sessionData.user_prompt,
+          source_content: currentContent,
+          session_metadata: {
+            step: 'preprocessed',
+            processing_time: Date.now(),
+            validationResults: validationResults
+          }
+        }
+      );
+      console.log('💾 PIPELINE STEP 4 SAVE RESULT:', saveResult);
+    } catch (error) {
+      console.error('❌ PIPELINE STEP 4 SAVE FAILED:', error);
+    }
+  }
+
+  onProgress?.('Complete', 100);
+  console.log('✅ PIPELINE COMPLETE: All steps finished', {
+    finalContentLength: preprocessed.length,
+    sessionId: sessionData?.session_id
+  });
+
+  return {
+    content: preprocessed,
+    session_id: sessionData?.session_id,
+    validationResults,
+  };
+  } finally {
+    // E1: Always clear the timeout
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Applies AI suggestions pipeline with simple error handling
+ *
+ * • Runs complete AI suggestion pipeline and updates editor on success
+ * • Original content remains untouched until entire pipeline succeeds
+ * • Optionally includes source content for informed editing
+ * • Optionally saves session data to database when sessionData is provided
+ * • Returns success status with final content or error details
+ * • Used by: UI components to get AI suggestions with progress tracking
+ * • Calls: runAISuggestionsPipeline
+ */
+export async function getAndApplyAISuggestions(
+  currentContent: string,
+  editorRef: React.RefObject<LexicalEditorRef | null> | null,
+  onProgress?: (step: string, progress: number) => void,
+  sessionData?: {
+    session_id?: string;
+    explanation_id: number;
+    explanation_title: string;
+    user_prompt: string;
+    sources?: SourceForPromptType[];
+  },
+  userId?: string
+): Promise<{ success: boolean; content?: string; error?: string; session_id?: string; validationResults?: PipelineValidationResults }> {
+  console.log('🎯 getAndApplyAISuggestions CALLED:', {
+    contentLength: currentContent.length,
+    hasSessionData: !!sessionData,
+    sessionData: sessionData ? {
+      session_id: sessionData.session_id,
+      explanation_id: sessionData.explanation_id,
+      explanation_title: sessionData.explanation_title,
+      user_prompt: sessionData.user_prompt,
+      sourcesCount: sessionData.sources?.length ?? 0
+    } : null
+  });
+
+  try {
+    // Generate session_id if sessionData is provided but missing session_id
+    let sessionDataWithId = sessionData;
+    if (sessionData && !sessionData.session_id) {
+      console.log('🔑 Generating new session_id...');
+      // Generate proper UUID for session_id using browser-compatible method
+      const sessionId = crypto.randomUUID ? crypto.randomUUID() :
+        'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+          const r = Math.random() * 16 | 0;
+          const v = c == 'x' ? r : (r & 0x3 | 0x8);
+          return v.toString(16);
+        });
+      sessionDataWithId = {
+        ...sessionData,
+        session_id: sessionId
+      };
+      console.log('🔑 Generated session_id:', sessionDataWithId.session_id);
+    } else if (sessionData?.session_id) {
+      console.log('🔑 Using existing session_id:', sessionData.session_id);
+    } else {
+      console.log('⚠️ No session data provided - pipeline will not save to database');
+    }
+
+    // Run the entire pipeline - original content stays untouched until success
+    // userId defaults to nil UUID if not provided (for backward compatibility)
+    const effectiveUserId = userId || ANONYMOUS_USER_UUID;
+    console.log('🚀 Calling runAISuggestionsPipeline with sessionData:', sessionDataWithId, 'userId:', effectiveUserId);
+    const result = await runAISuggestionsPipeline(currentContent, effectiveUserId, onProgress, sessionDataWithId);
+
+    return {
+      success: true,
+      content: result.content,
+      session_id: result.session_id,
+      validationResults: result.validationResults,
+    };
+
+  } catch (error) {
+    console.error('AI Pipeline failed:', error);
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'AI processing failed',
+      content: currentContent // Original content is unchanged
+    };
+  }
+}
+
+/**
+ * Handles getting AI suggestions for text improvement
+ * @param currentText - The current text content
+ * @param userPrompt - The user's edit instruction
+ * @param callLLM - Function to call the OpenAI model
+ * @param logger - Logger utility for debugging
+ * @param userId - User ID for LLM tracking (optional, defaults to nil UUID)
+ * @returns Promise that resolves to the AI suggestion response
+ */
+export async function getAISuggestions(
+    currentText: string,
+    userPrompt: string,
+    callLLM: (prompt: string, call_source: string, userid: string, model: string, streaming: boolean, setText: ((text: string) => void) | null) => Promise<string>,
+    logger: any,
+    userId: string = ANONYMOUS_USER_UUID
+): Promise<string> {
+    try {
+        const prompt = createAISuggestionPrompt(currentText, userPrompt);
+
+        logger.debug('AI Suggestion Request', {
+            textLength: currentText.length,
+            promptLength: prompt.length
+        });
+
+        const response = await callLLM(
+            prompt,
+            'editor_ai_suggestions',
+            userId,
+            DEFAULT_MODEL,
+            false,
+            null
+        );
+
+        logger.debug('AI Suggestion Response', {
+            responseLength: response.length,
+            response: response
+        });
+
+        return response;
+    } catch (error) {
+        logger.error('AI Suggestion Error', {
+            error: error instanceof Error ? error.message : String(error)
+        });
+        throw error;
+    }
+}

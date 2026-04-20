@@ -1,0 +1,100 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/evolution/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/.auth
+/playwright-report
+/test-results
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# server logs
+server.log
+server-*.log
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+!.env.prod.readonly.example
+!.env.staging.readonly.example
+.env.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+.playwright-mcp/
+test-results-debug/
+client.log
+
+# E2E test artifacts
+.vercel-bypass-cookie.json
+
+# Claude Code
+.claude/review-state/
+.claude/agents
+.claude/logs/
+.claude/metrics/
+.claude/push-gate.json
+
+# Evolution pipeline output
+evolution-output-*.json
+experiments/strategy-experiment*.json
+docs/planning/deploy/
+
+# Worktree environment artifacts
+.bash_profile
+.bashrc
+.zshrc
+.zprofile
+.profile
+.gitconfig
+.gitmodules
+.ripgreprc
+.idea
+.vscode
+/HEAD
+/config
+/hooks
+/objects
+/refs
+# Maintenance logs
+logs/maintenance/
+
+evolution/.next/
+.claude/worktrees/
+.playwright-mcp
+.npm-cache/
+npm-install.log
+screenshots/
+docs/planning/testing_fixes_20260329/
+timeline-*.png
+.claude/scheduled_tasks.lock

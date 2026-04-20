@@ -1,0 +1,204 @@
+import { createSupabaseServerClient } from '@/lib/utils/supabase/server';
+import { type TopicFullDbType, type TopicInsertType } from '@/lib/schemas/schemas';
+import { withLogging } from '@/lib/logging/server/automaticServerLoggingBase';
+
+/**
+ * Service for interacting with the topics table in Supabase
+ * 
+ * Example usage:
+ * ```typescript
+ * // Create a topic
+ * const newTopic = await createTopic({ 
+ *   topic_title: "Physics",
+ *   topic_description: "Fundamental science of matter and energy"
+ * });
+ * 
+ * // Get recent topics
+ * const topics = await getRecentTopics(5);
+ * 
+ * // Get topic by ID
+ * const topic = await getTopicById(1);
+ * ```
+ */
+
+/**
+ * Create a new topic record only if it does not already exist (by topic_title)
+ * - Checks for an existing topic with the same topic_title
+ * - If found, returns the existing topic (first one if duplicates exist)
+ * - If not found, inserts a new topic and returns it
+ * - Used by saveExplanationAndTopic and other topic creation flows
+ * - Calls supabase topics table for both select and insert
+ */
+async function createTopicImpl(topic: TopicInsertType): Promise<TopicFullDbType> {
+  const supabase = await createSupabaseServerClient()
+
+  // Check if topic with the same title exists
+  // Use .limit(1) instead of .single() to handle duplicate topics gracefully
+  // (duplicates can occur from race conditions or previous test runs)
+  const { data: existingList, error: selectError } = await supabase
+    .from('topics')
+    .select()
+    .eq('topic_title', topic.topic_title)
+    .limit(1);
+
+  if (selectError) throw selectError;
+  if (existingList && existingList.length > 0) return existingList[0] as TopicFullDbType;
+
+  // Insert if not found
+  const { data, error } = await supabase
+    .from('topics')
+    .insert(topic)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data as TopicFullDbType;
+}
+
+/**
+ * Get a topic record by ID
+ * @param id Topic record ID
+ * @returns Topic record if found
+ */
+async function getTopicByIdImpl(id: number): Promise<TopicFullDbType | null> {
+  const supabase = await createSupabaseServerClient()
+
+  const { data, error } = await supabase
+    .from('topics')
+    .select()
+    .eq('id', id)
+    .single();
+
+  if (error) throw error;
+  return data as TopicFullDbType;
+}
+
+/**
+ * Get recent topics with pagination
+ * @param limit Number of records to return
+ * @param offset Number of records to skip
+ * @param orderBy Order by column
+ * @param order Order direction
+ * @returns Array of topic records
+ */
+async function getRecentTopicsImpl(
+  limit: number = 10,
+  offset: number = 0,
+  orderBy: string = 'created_at',
+  order: 'asc' | 'desc' = 'desc'
+): Promise<TopicFullDbType[]> {
+  const supabase = await createSupabaseServerClient()
+  
+  // Validate parameters
+  if (limit <= 0) limit = 10;
+  if (offset < 0) offset = 0;
+  
+  const query = supabase
+    .from('topics')
+    .select()
+    .order(orderBy, { ascending: order === 'asc' })
+    .range(offset, offset + limit - 1);
+
+  const { data, error } = await query;
+
+  if (error) throw error;
+  return (data || []) as TopicFullDbType[];
+}
+
+/**
+ * Update an existing topic record
+ * @param id Topic record ID
+ * @param updates Partial topic data to update
+ * @returns Updated topic record
+ */
+async function updateTopicImpl(
+  id: number,
+  updates: Partial<TopicInsertType>
+): Promise<TopicFullDbType> {
+  const supabase = await createSupabaseServerClient()
+  
+  const { data, error } = await supabase
+    .from('topics')
+    .update(updates)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data as TopicFullDbType;
+}
+
+/**
+ * Delete a topic record
+ * @param id Topic record ID
+ * @returns void
+ */
+async function deleteTopicImpl(id: number): Promise<void> {
+  const supabase = await createSupabaseServerClient()
+  
+  const { error } = await supabase
+    .from('topics')
+    .delete()
+    .eq('id', id);
+
+  if (error) throw error;
+}
+
+/**
+ * Search topics by title
+ * @param searchTerm Search term to match against topic titles
+ * @param limit Maximum number of results to return
+ * @returns Array of matching topic records
+ */
+async function searchTopicsByTitleImpl(
+  searchTerm: string,
+  limit: number = 10
+): Promise<TopicFullDbType[]> {
+  const supabase = await createSupabaseServerClient()
+  
+  const { data, error } = await supabase
+    .from('topics')
+    .select()
+    .ilike('topic_title', `%${searchTerm}%`)
+    .limit(limit);
+
+  if (error) throw error;
+  return (data || []) as TopicFullDbType[];
+}
+
+// Wrap all async functions with automatic logging for entry/exit/timing
+export const createTopic = withLogging(
+  createTopicImpl,
+  'createTopic',
+  { logErrors: true }
+);
+
+export const getTopicById = withLogging(
+  getTopicByIdImpl,
+  'getTopicById',
+  { logErrors: true }
+);
+
+export const getRecentTopics = withLogging(
+  getRecentTopicsImpl,
+  'getRecentTopics',
+  { logErrors: true }
+);
+
+export const updateTopic = withLogging(
+  updateTopicImpl,
+  'updateTopic',
+  { logErrors: true }
+);
+
+export const deleteTopic = withLogging(
+  deleteTopicImpl,
+  'deleteTopic',
+  { logErrors: true }
+);
+
+export const searchTopicsByTitle = withLogging(
+  searchTopicsByTitleImpl,
+  'searchTopicsByTitle',
+  { logErrors: true }
+);

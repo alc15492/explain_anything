@@ -1,0 +1,1632 @@
+'use client';
+
+import LexicalEditor, { LexicalEditorRef, EditModeToggle } from '@/editorFiles/lexicalEditor/LexicalEditor';
+import { useState, useEffect, useRef, useCallback, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { generateAISuggestionsAction, applyAISuggestionsAction, saveTestingPipelineStepAction, getTestingPipelineRecordsByStepAction, updateTestingPipelineRecordSetNameAction } from '@/editorFiles/actions/actions';
+import { getExplanationByIdAction, getAISuggestionSessionsAction, loadAISuggestionSessionAction } from '@/actions/actions';
+import { logger } from '@/lib/client_utilities';
+import { RenderCriticMarkupFromMDAstDiff } from '@/editorFiles/markdownASTdiff/markdownASTdiff';
+import { preprocessCriticMarkup } from '@/editorFiles/lexicalEditor/importExportUtils';
+import { unified } from 'unified';
+import remarkParse from 'remark-parse';
+import {
+    mergeAISuggestionOutputAction,
+    validateAISuggestionOutputAction,
+    getAndApplyAISuggestionsAction
+} from '@/editorFiles/actions/actions';
+import { ValidationSummaryDashboard, ValidationChecksTable } from './ValidationSummaryDashboard';
+import { ValidationStatusBadge } from './ValidationStatusBadge';
+import {
+    PipelineValidationResults,
+    VALIDATION_DESCRIPTIONS,
+    validateStep2Output,
+    validateCriticMarkup,
+} from '@/editorFiles/validation/pipelineValidation';
+
+export const dynamic = 'force-dynamic';
+
+function EditorTestPageContent() {
+    const searchParams = useSearchParams();
+    const [currentContent, setCurrentContent] = useState<string>('');
+    const [aiSuggestions, setAiSuggestions] = useState<string>('');
+    const [rawAIResponse, setRawAIResponse] = useState<string>('');
+    const [isLoadingSuggestions, setIsLoadingSuggestions] = useState<boolean>(false);
+    const [suggestionError, setSuggestionError] = useState<string>('');
+    const [appliedEdits, setAppliedEdits] = useState<string>('');
+    const [isApplyingEdits, setIsApplyingEdits] = useState<boolean>(false);
+    const [applyError, setApplyError] = useState<string>('');
+    const [isApplyingDiff, setIsApplyingDiff] = useState<boolean>(false);
+    const [diffError, setDiffError] = useState<string>('');
+    const [markdownASTDiffResult, setMarkdownASTDiffResult] = useState<string>('');
+    const [isPreprocessing, setIsPreprocessing] = useState<boolean>(false);
+    const [preprocessingError, setPreprocessingError] = useState<string>('');
+    const [preprocessedMarkdown, setPreprocessedMarkdown] = useState<string>('');
+    const [isMarkdownMode, setIsMarkdownMode] = useState<boolean>(true);
+    const [testSetName, setTestSetName] = useState<string>('');
+
+    // Dropdown state for loading previous results
+    const [step1Options, setStep1Options] = useState<Array<{ id: number; name: string; content: string; created_at: string }>>([]);
+    const [step2Options, setStep2Options] = useState<Array<{ id: number; name: string; content: string; created_at: string }>>([]);
+    const [step3Options, setStep3Options] = useState<Array<{ id: number; name: string; content: string; created_at: string }>>([]);
+    const [step4Options, setStep4Options] = useState<Array<{ id: number; name: string; content: string; created_at: string }>>([]);
+
+    // Selected dropdown items for rename functionality
+    const [selectedStep1Id, setSelectedStep1Id] = useState<number | null>(null);
+    const [selectedStep2Id, setSelectedStep2Id] = useState<number | null>(null);
+    const [selectedStep3Id, setSelectedStep3Id] = useState<number | null>(null);
+    const [selectedStep4Id, setSelectedStep4Id] = useState<number | null>(null);
+
+    // Validation state for preprocessed step
+    const [validationErrors, setValidationErrors] = useState<string[]>([]);
+
+    // Pipeline validation results state
+    const [pipelineValidationResults, setPipelineValidationResults] = useState<PipelineValidationResults>({});
+
+    // Export fixture state
+    const [fixtureExported, setFixtureExported] = useState<boolean>(false);
+
+    // Pipeline function state
+    const [isPipelineRunning, setIsPipelineRunning] = useState<boolean>(false);
+    const [pipelineError, setPipelineError] = useState<string>('');
+    const [pipelineProgress, setPipelineProgress] = useState<{step: string; progress: number}>({step: '', progress: 0});
+
+    // Explanation loading state
+    const [error, setError] = useState<string>('');
+    const [loadedExplanationTitle, setLoadedExplanationTitle] = useState<string>('');
+
+    // AI Suggestion Session state
+    const [sessionOptions, setSessionOptions] = useState<Array<{
+        session_id: string;
+        explanation_id: number;
+        explanation_title: string;
+        user_prompt: string;
+        created_at: string;
+    }>>([]);
+    const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+    const [loadedSessionData, setLoadedSessionData] = useState<{
+        session_metadata: {
+            session_id: string;
+            explanation_id: number;
+            explanation_title: string;
+            user_prompt: string;
+            source_content: string;
+        };
+        steps: Array<{
+            step: string;
+            content: string;
+            session_metadata: Record<string, unknown>;
+            created_at: string;
+        }>;
+    } | null>(null);
+
+    const editorRef = useRef<LexicalEditorRef>(null);
+
+    // Edit mode state management
+    const [isEditMode, setIsEditMode] = useState<boolean>(true);
+
+    const toggleEditMode = () => {
+        setIsEditMode(!isEditMode);
+    };
+
+    // Default content about Albert Einstein
+    const defaultContent = `# Albert Einstein: The Revolutionary Physicist
+
+Albert Einstein was a German-born theoretical physicist who developed the theory of relativity, one of the two pillars of modern physics. Born on March 14, 1879, in Ulm, Germany, Einstein's revolutionary work fundamentally changed our understanding of space, time, and the universe itself.
+
+## The Famous Equation
+
+Einstein's most famous equation, **E = mc²**, demonstrates the equivalence of mass and energy, showing that a small amount of mass can be converted into a tremendous amount of energy. This insight laid the groundwork for nuclear power and fundamentally altered our understanding of the physical world.
+
+## Legacy and Impact
+
+Einstein's contributions to physics earned him the Nobel Prize in Physics in 1921, and his work continues to influence scientific research and technological development to this day.`;
+
+    // Database loading function for explanation_id
+    const loadExplanationForTesting = useCallback(async (explanationId: number) => {
+        try {
+            setError('');
+            // Reuse the same action from results page
+            const explanation = await getExplanationByIdAction({ id: explanationId });
+
+            if (explanation && editorRef.current) {
+                // Load into Lexical editor (replaces hardcoded Einstein content)
+                editorRef.current.setContentFromMarkdown(explanation.content);
+                setCurrentContent(explanation.content);
+                setLoadedExplanationTitle(explanation.explanation_title);
+                setTestSetName(`explanation-${explanationId}-test`);
+
+                // Validate rendering parity
+                const warnings = validateRenderingParity(explanationId, explanation.content);
+
+                console.log(`✅ Loaded explanation ${explanationId}: "${explanation.explanation_title}"`);
+                console.log(`📊 Content stats: ${explanation.content.length} characters`);
+                if (warnings.length > 0) {
+                    console.log(`⚠️ Rendering validation warnings:`, warnings);
+                } else {
+                    console.log(`✅ All content formats validated successfully`);
+                }
+            } else {
+                setError(`Explanation ${explanationId} not found`);
+            }
+        } catch (error) {
+            console.error('Failed to load explanation:', error);
+            setError(`Failed to load explanation ${explanationId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }, []); // No dependencies needed as the function doesn't rely on changing values
+
+    // Content format validation function
+    const validateRenderingParity = (explanationId: number, content: string) => {
+        const warnings: string[] = [];
+
+        // Check for LaTeX expressions that need MathPlugin
+        if (content.includes('$') || content.includes('\\\\(')) {
+            warnings.push('LaTeX expressions detected - ensure MathPlugin renders correctly');
+        }
+
+        // Check for complex markdown structures
+        if (content.includes('```')) {
+            warnings.push('Code blocks detected - verify syntax highlighting');
+        }
+
+        if (content.includes('|')) {
+            warnings.push('Tables detected - ensure proper rendering');
+        }
+
+        console.log(`Explanation ${explanationId} rendering validation:`, warnings);
+        return warnings;
+    };
+
+    // Set initial content and test set name when component mounts
+    useEffect(() => {
+        setCurrentContent(defaultContent);
+        // Generate a unique test set name based on timestamp
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        setTestSetName(`test-${timestamp}`);
+        console.log('Initial content set:', defaultContent.length, 'characters');
+    }, [defaultContent]);
+
+    // Handle URL parameters for explanation_id and session_id
+    useEffect(() => {
+        const explanationId = searchParams.get('explanation_id');
+        const sessionId = searchParams.get('session_id');
+
+        if (explanationId) {
+            const parsedId = parseInt(explanationId);
+            if (!isNaN(parsedId)) {
+                console.log(`Loading explanation from URL parameter: ${parsedId}`);
+                loadExplanationForTesting(parsedId);
+
+                // Load sessions for this explanation
+                loadSessionOptions(parsedId);
+            } else {
+                setError(`Invalid explanation_id parameter: ${explanationId}`);
+            }
+        }
+
+        if (sessionId) {
+            console.log(`Loading session from URL parameter: ${sessionId}`);
+            loadSessionData(sessionId);
+        }
+    }, [searchParams, loadExplanationForTesting]);
+
+    // Load AI suggestion sessions for dropdown
+    const loadSessionOptions = async (explanationId?: number) => {
+        try {
+            const result = await getAISuggestionSessionsAction(explanationId);
+            if (result.success && result.data) {
+                setSessionOptions(result.data);
+                console.log(`Loaded ${result.data.length} AI suggestion sessions`);
+            } else {
+                console.error('Failed to load session options:', result.error);
+            }
+        } catch (error) {
+            console.error('Failed to load session options:', error);
+        }
+    };
+
+    // Load specific session data and populate all pipeline steps
+    const loadSessionData = async (sessionId: string) => {
+        try {
+            const result = await loadAISuggestionSessionAction(sessionId);
+            if (result.success && result.data) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                setLoadedSessionData(result.data as any);
+                setSelectedSessionId(sessionId);
+
+                // Set the original content from session
+                if (result.data.session_metadata.source_content && editorRef.current) {
+                    editorRef.current.setContentFromMarkdown(result.data.session_metadata.source_content);
+                    setCurrentContent(result.data.session_metadata.source_content);
+                }
+
+                // Populate all step data from session
+                const steps = result.data.steps;
+
+                // Find each step and populate the corresponding state
+                const step1 = steps.find(s => s.step === 'step1_ai_suggestions');
+                const step2 = steps.find(s => s.step === 'step2_applied_edits');
+                const step3 = steps.find(s => s.step === 'step3_critic_markup');
+                const step4 = steps.find(s => s.step === 'step4_preprocessed');
+
+                if (step1) setAiSuggestions(step1.content);
+                if (step2) setAppliedEdits(step2.content);
+                if (step3) setMarkdownASTDiffResult(step3.content);
+                if (step4) setPreprocessedMarkdown(step4.content);
+
+                // Load validation results from step4's session_metadata if available
+                if (step4?.session_metadata?.validationResults) {
+                    const validationResults = step4.session_metadata.validationResults as PipelineValidationResults;
+                    setPipelineValidationResults(validationResults);
+                    console.log('📊 Loaded validation results from session:', validationResults);
+                }
+
+                // Set test set name based on session
+                setTestSetName(`session-${sessionId.slice(0, 8)}`);
+                setLoadedExplanationTitle(result.data.session_metadata.explanation_title ?? '');
+
+                console.log(`✅ Loaded session ${sessionId}: "${result.data.session_metadata.user_prompt}"`);
+                console.log(`📊 Session contains ${steps.length} pipeline steps`);
+            } else {
+                console.error('Failed to load session data:', result.error);
+                setError(`Failed to load session ${sessionId}: ${result.error?.message}`);
+            }
+        } catch (error) {
+            console.error('Failed to load session data:', error);
+            setError(`Failed to load session ${sessionId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    };
+
+    // Handle session dropdown selection
+    const handleSessionSelection = (event: React.ChangeEvent<HTMLSelectElement>) => {
+        const sessionId = event.target.value;
+        if (!sessionId) {
+            setSelectedSessionId(null);
+            setLoadedSessionData(null);
+            return;
+        }
+        loadSessionData(sessionId);
+    };
+
+    // Load dropdown options for each step
+    const loadDropdownOptions = async () => {
+        try {
+            const [step1Result, step2Result, step3Result, step4Result] = await Promise.all([
+                getTestingPipelineRecordsByStepAction('1_ai_suggestion'),
+                getTestingPipelineRecordsByStepAction('2_edits_applied_to_markdown'),
+                getTestingPipelineRecordsByStepAction('3_diff_applied_to_markdown'),
+                getTestingPipelineRecordsByStepAction('4_preprocess_diff_before_import')
+            ]);
+
+            if (step1Result.success) setStep1Options(step1Result.data || []);
+            if (step2Result.success) setStep2Options(step2Result.data || []);
+            if (step3Result.success) setStep3Options(step3Result.data || []);
+            if (step4Result.success) setStep4Options(step4Result.data || []);
+        } catch (error) {
+            console.error('Failed to load dropdown options:', error);
+        }
+    };
+
+    // Load dropdown options when component mounts
+    useEffect(() => {
+        loadDropdownOptions();
+    }, []);
+
+    // Handle dropdown selection for each step
+    const handleStep1Selection = (event: React.ChangeEvent<HTMLSelectElement>) => {
+        const selectedId = parseInt(event.target.value);
+        if (isNaN(selectedId)) {
+            setSelectedStep1Id(null);
+            return;
+        }
+        setSelectedStep1Id(selectedId);
+        const selectedOption = step1Options.find(option => option.id === selectedId);
+        if (selectedOption) {
+            setAiSuggestions(selectedOption.content);
+            console.log(`Loaded step 1 content from set: ${selectedOption.name}`);
+        }
+    };
+
+    const handleStep2Selection = (event: React.ChangeEvent<HTMLSelectElement>) => {
+        const selectedId = parseInt(event.target.value);
+        if (isNaN(selectedId)) {
+            setSelectedStep2Id(null);
+            return;
+        }
+        setSelectedStep2Id(selectedId);
+        const selectedOption = step2Options.find(option => option.id === selectedId);
+        if (selectedOption) {
+            setAppliedEdits(selectedOption.content);
+            console.log(`Loaded step 2 content from set: ${selectedOption.name}`);
+        }
+    };
+
+    const handleStep3Selection = (event: React.ChangeEvent<HTMLSelectElement>) => {
+        const selectedId = parseInt(event.target.value);
+        if (isNaN(selectedId)) {
+            setSelectedStep3Id(null);
+            return;
+        }
+        setSelectedStep3Id(selectedId);
+        const selectedOption = step3Options.find(option => option.id === selectedId);
+        if (selectedOption) {
+            setMarkdownASTDiffResult(selectedOption.content);
+            console.log(`Loaded step 3 content from set: ${selectedOption.name}`);
+        }
+    };
+
+    const handleStep4Selection = (event: React.ChangeEvent<HTMLSelectElement>) => {
+        const selectedId = parseInt(event.target.value);
+        if (isNaN(selectedId)) {
+            setSelectedStep4Id(null);
+            setValidationErrors([]);
+            return;
+        }
+        setSelectedStep4Id(selectedId);
+        const selectedOption = step4Options.find(option => option.id === selectedId);
+        if (selectedOption) {
+            setPreprocessedMarkdown(selectedOption.content);
+
+            // Validate the loaded content
+            const errors = validatePreprocessedContent(selectedOption.content);
+            setValidationErrors(errors);
+
+            if (errors.length > 0) {
+                console.log('⚠️ Validation errors found in loaded content:', errors);
+            } else {
+                console.log('✅ Loaded content passed validation');
+            }
+
+            console.log(`Loaded step 4 content from set: ${selectedOption.name}`);
+        }
+    };
+
+    // Handle rename functionality for each step
+    const handleRenameStep = async (stepNumber: number, recordId: number | null) => {
+        if (!recordId) {
+            alert('Please select an item from the dropdown first.');
+            return;
+        }
+
+        const currentOption = (() => {
+            switch (stepNumber) {
+                case 1: return step1Options.find(option => option.id === recordId);
+                case 2: return step2Options.find(option => option.id === recordId);
+                case 3: return step3Options.find(option => option.id === recordId);
+                case 4: return step4Options.find(option => option.id === recordId);
+                default: return null;
+            }
+        })();
+
+        if (!currentOption) {
+            alert('Selected item not found.');
+            return;
+        }
+
+        const newName = prompt(`Rename "${currentOption.name}" to:`, currentOption.name);
+        if (!newName || newName === currentOption.name) {
+            return;
+        }
+
+        try {
+            const result = await updateTestingPipelineRecordSetNameAction(recordId, newName);
+            if (result.success) {
+                console.log(`✅ Renamed "${currentOption.name}" to "${newName}"`);
+                // Refresh the dropdown options to show the updated name
+                await loadDropdownOptions();
+            } else {
+                alert('Failed to rename: ' + (result.error?.message || 'Unknown error'));
+            }
+        } catch (error) {
+            console.error('Failed to rename:', error);
+            alert('Failed to rename the item.');
+        }
+    };
+
+    // Validation function for preprocessed content
+    const validatePreprocessedContent = (content: string): string[] => {
+        const errors: string[] = [];
+        const lines = content.split('\n');
+
+        // First, identify all CriticMarkup blocks and their ranges
+        const criticMarkupRanges: Array<{start: number, end: number, type: string}> = [];
+        let currentBlock: {start: number, type: string, openTag: string} | null = null;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i]!;
+
+            // Check for opening CriticMarkup tags
+            const openTags = [
+                { pattern: /\{~~/, type: 'substitution', close: '~~}' },
+                { pattern: /\{\+\+/, type: 'addition', close: '++}' },
+                { pattern: /\{--/, type: 'deletion', close: '--}' },
+                { pattern: /\{>>/, type: 'comment', close: '<<}' }
+            ];
+
+            for (const tag of openTags) {
+                if (tag.pattern.test(line) && !currentBlock) {
+                    currentBlock = { start: i, type: tag.type, openTag: tag.close };
+                    break;
+                }
+            }
+
+            // Check for closing tags
+            if (currentBlock && line.includes(currentBlock.openTag)) {
+                criticMarkupRanges.push({
+                    start: currentBlock.start,
+                    end: i,
+                    type: currentBlock.type
+                });
+                currentBlock = null;
+            }
+        }
+
+        // Helper function to check if a line is inside any CriticMarkup block
+        const isLineInCriticMarkup = (lineIndex: number): boolean => {
+            return criticMarkupRanges.some(range =>
+                lineIndex >= range.start && lineIndex <= range.end
+            );
+        };
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i]!;
+            const previousLine = i > 0 ? lines[i - 1]! : '';
+
+            // Check A: All headings not enclosed in criticmarkup begin on a newline
+            const headingMatch = line.match(/^(#+)\s/);
+            if (headingMatch && !isLineInCriticMarkup(i)) {
+                // This is a regular heading not in CriticMarkup, check if it starts on a newline
+                if (i > 0 && previousLine.trim() !== '') {
+                    errors.push(`Line ${i + 1}: Heading "${line.trim()}" should start on a newline (previous line: "${previousLine.trim()}")`);
+                }
+            }
+
+            // Check B: Any criticmarkup containing headings starts on a newline
+            // Check if this line starts a CriticMarkup block that contains headings
+            const startsBlock = criticMarkupRanges.find(range => range.start === i);
+            if (startsBlock) {
+                // Check if this block contains any headings
+                let blockContainsHeading = false;
+                for (let j = startsBlock.start; j <= startsBlock.end; j++) {
+                    if (lines[j]!.includes('#')) {
+                        blockContainsHeading = true;
+                        break;
+                    }
+                }
+
+                if (blockContainsHeading && i > 0 && previousLine.trim() !== '') {
+                    errors.push(`Line ${i + 1}: CriticMarkup containing heading should start on a newline (previous line: "${previousLine.trim()}")`);
+                }
+            }
+        }
+
+        return errors;
+    };
+
+    // Handle markdown mode toggle
+    const handleMarkdownToggle = () => {
+        if (editorRef.current) {
+            // Toggle the internal state first
+            const newMarkdownMode = !isMarkdownMode;
+            setIsMarkdownMode(newMarkdownMode);
+            // Use the new toggle method from LexicalEditor
+            editorRef.current.toggleMarkdownMode();
+        }
+    };
+
+    // Handle AI suggestions
+    const handleGetAISuggestions = async () => {
+        if (!currentContent) {
+            setSuggestionError('No content available. Please type something in the editor first.');
+            return;
+        }
+
+        setIsLoadingSuggestions(true);
+        setSuggestionError('');
+        setAiSuggestions('');
+
+        try {
+            // Use the existing action to get AI suggestions
+            // Use nil UUID for anonymous/test users (database requires valid UUID format)
+            const result = await generateAISuggestionsAction(
+                currentContent,
+                '00000000-0000-0000-0000-000000000000',
+                'Improve the overall quality of this content'  // Default prompt for debug page
+            );
+
+            if (result.success && result.data) {
+                // Store the raw response for debugging
+                setRawAIResponse(result.data);
+
+                // Validate the response against the schema
+                const validationActionResult = await validateAISuggestionOutputAction(result.data);
+
+                if (validationActionResult.success && validationActionResult.data?.success) {
+                    // Merge the structured output into a readable format
+                    const mergeActionResult = await mergeAISuggestionOutputAction(validationActionResult.data.data.edits);
+                    if (mergeActionResult.success && mergeActionResult.data) {
+                        setAiSuggestions(mergeActionResult.data);
+                    }
+
+                    // Step 1: Save merged AI suggestion to database
+                    try {
+                        const saveResult = await saveTestingPipelineStepAction(
+                            testSetName,
+                            '1_ai_suggestion',
+                            mergeActionResult.data ?? ''
+                        );
+
+                        if (saveResult.success && saveResult.data?.saved) {
+                            console.log('✅ Step 1: Merged AI suggestion saved to database');
+                        } else {
+                            console.log('ℹ️ Step 1: Merged AI suggestion already exists in database');
+                        }
+                    } catch (saveError) {
+                        console.error('❌ Failed to save merged AI suggestion:', saveError);
+                    }
+
+                    logger.debug('AI suggestions received and validated', {
+                        responseLength: result.data.length,
+                        editsCount: validationActionResult.data?.data?.edits?.length ?? 0
+                    });
+                } else {
+                    setSuggestionError(`AI response validation failed: ${validationActionResult.error?.message ?? 'Unknown error'}`);
+                }
+            } else {
+                setSuggestionError(result.error?.message || 'Failed to generate AI suggestions');
+            }
+        } catch (error) {
+            setSuggestionError(error instanceof Error ? error.message : 'An unexpected error occurred');
+        } finally {
+            setIsLoadingSuggestions(false);
+        }
+    };
+
+    // Handle applying AI suggestions
+    const handleApplyAISuggestions = async () => {
+        if (!aiSuggestions) {
+            setApplyError('No AI suggestions available. Please generate suggestions first.');
+            return;
+        }
+
+        if (!currentContent) {
+            setApplyError('No original content available.');
+            return;
+        }
+
+        setIsApplyingEdits(true);
+        setApplyError('');
+        setAppliedEdits('');
+
+        try {
+            // Use the existing action to apply AI suggestions
+            // Use nil UUID for anonymous/test users (database requires valid UUID format)
+            const result = await applyAISuggestionsAction(
+                aiSuggestions,
+                currentContent,
+                '00000000-0000-0000-0000-000000000000'
+            );
+
+            if (result.success && result.data) {
+                setAppliedEdits(result.data);
+
+                // Run Step 2 validation
+                const step2Validation = validateStep2Output(currentContent, result.data);
+                setPipelineValidationResults(prev => ({
+                    ...prev,
+                    step2: { ...step2Validation, description: VALIDATION_DESCRIPTIONS.step2 },
+                }));
+
+                // Step 2: Save edits applied to database
+                try {
+                    const saveResult = await saveTestingPipelineStepAction(
+                        testSetName,
+                        '2_edits_applied_to_markdown',
+                        result.data
+                    );
+
+                    if (saveResult.success && saveResult.data?.saved) {
+                        console.log('✅ Step 2: Edits applied saved to database');
+                    } else {
+                        console.log('ℹ️ Step 2: Edits applied already exists in database');
+                    }
+                } catch (saveError) {
+                    console.error('❌ Failed to save edits applied:', saveError);
+                }
+
+                logger.debug('AI suggestions applied successfully', {
+                    responseLength: result.data.length
+                });
+            } else {
+                setApplyError(result.error?.message || 'Failed to apply AI suggestions');
+            }
+        } catch (error) {
+            setApplyError(error instanceof Error ? error.message : 'An unexpected error occurred');
+        } finally {
+            setIsApplyingEdits(false);
+        }
+    };
+
+    // Handle applying 2-pass diff
+    const handleApplyDiff = async () => {
+        if (!currentContent) {
+            setDiffError('No original content available.');
+            return;
+        }
+
+        if (!appliedEdits) {
+            setDiffError('No applied edits available. Please apply AI suggestions first.');
+            return;
+        }
+
+        setIsApplyingDiff(true);
+        setDiffError('');
+        setMarkdownASTDiffResult('');
+
+        try {
+            // Use markdown AST diff
+            const processor = unified().use(remarkParse);
+            const beforeAST = processor.parse(currentContent);
+            const afterAST = processor.parse(appliedEdits);
+            
+            const criticMarkup = RenderCriticMarkupFromMDAstDiff(beforeAST, afterAST);
+            setMarkdownASTDiffResult(criticMarkup);
+
+            // Run Step 3 validation
+            const step3Validation = validateCriticMarkup(criticMarkup);
+            setPipelineValidationResults(prev => ({
+                ...prev,
+                step3: { ...step3Validation, description: VALIDATION_DESCRIPTIONS.step3 },
+            }));
+
+            // Step 3: Save raw markdown to database
+            try {
+                const saveResult = await saveTestingPipelineStepAction(
+                    testSetName,
+                    '3_diff_applied_to_markdown',
+                    criticMarkup
+                );
+
+                if (saveResult.success && saveResult.data?.saved) {
+                    console.log('✅ Step 3: Raw markdown saved to database');
+                } else {
+                    console.log('ℹ️ Step 3: Raw markdown already exists in database');
+                }
+            } catch (saveError) {
+                console.error('❌ Failed to save raw markdown:', saveError);
+            }
+
+            // Print the markdown with CriticMarkup to console
+            console.log('📝 Diff Applied - Markdown with CriticMarkup (AST Diff):');
+            console.log(criticMarkup);
+
+            logger.debug('Markdown AST diff applied successfully', {
+                beforeLength: currentContent.length,
+                afterLength: appliedEdits.length,
+                criticMarkupLength: criticMarkup.length
+            });
+        } catch (error) {
+            setDiffError(error instanceof Error ? error.message : 'An unexpected error occurred while applying diff');
+        } finally {
+            setIsApplyingDiff(false);
+        }
+    };
+
+    // Handle preprocessing CriticMarkup
+    const handlePreprocessing = async () => {
+        if (!markdownASTDiffResult) {
+            setPreprocessingError('No markdown AST diff result available. Please apply diff first.');
+            return;
+        }
+
+        setIsPreprocessing(true);
+        setPreprocessingError('');
+        setPreprocessedMarkdown('');
+        setValidationErrors([]);
+
+        try {
+            const preprocessed = preprocessCriticMarkup(markdownASTDiffResult);
+            setPreprocessedMarkdown(preprocessed);
+
+            // Validate the preprocessed content
+            const errors = validatePreprocessedContent(preprocessed);
+            setValidationErrors(errors);
+
+            // Step 4: Save preprocessed content to database
+            try {
+                const saveResult = await saveTestingPipelineStepAction(
+                    testSetName,
+                    '4_preprocess_diff_before_import',
+                    preprocessed
+                );
+
+                if (saveResult.success && saveResult.data?.saved) {
+                    console.log('✅ Step 4: Preprocessed content saved to database');
+                } else {
+                    console.log('ℹ️ Step 4: Preprocessed content already exists in database');
+                }
+            } catch (saveError) {
+                console.error('❌ Failed to save preprocessed content:', saveError);
+            }
+
+            // Print validation results
+            if (errors.length > 0) {
+                console.log('⚠️ Validation errors found:', errors);
+            } else {
+                console.log('✅ Validation passed: All headings are properly formatted');
+            }
+
+            // Print the preprocessed markdown to console
+            console.log('📝 Preprocessed Markdown:');
+            console.log(preprocessed);
+
+            logger.debug('CriticMarkup preprocessing completed successfully', {
+                originalLength: markdownASTDiffResult.length,
+                preprocessedLength: preprocessed.length,
+                validationErrors: errors.length
+            });
+        } catch (error) {
+            setPreprocessingError(error instanceof Error ? error.message : 'An unexpected error occurred while preprocessing');
+        } finally {
+            setIsPreprocessing(false);
+        }
+    };
+
+    // Handle updating editor with preprocessed markdown
+    const handleUpdateEditorWithMarkdown = () => {
+        if (!preprocessedMarkdown) {
+            return;
+        }
+
+        if (editorRef.current) {
+            editorRef.current.setContentFromMarkdown(preprocessedMarkdown);
+            logger.debug('Editor updated with preprocessed markdown', {
+                markdownLength: preprocessedMarkdown.length
+            });
+        }
+    };
+
+    // Handle exporting current pipeline state as a test fixture
+    const handleExportAsFixture = async () => {
+        if (!currentContent || !appliedEdits || !markdownASTDiffResult || !preprocessedMarkdown) {
+            alert('Please complete all pipeline steps before exporting a fixture.');
+            return;
+        }
+
+        // Count diff operations in the CriticMarkup
+        const insCount = (markdownASTDiffResult.match(/\{\+\+/g) || []).length;
+        const delCount = (markdownASTDiffResult.match(/\{--/g) || []).length;
+        const updateCount = (markdownASTDiffResult.match(/\{~~/g) || []).length;
+        const totalOperations = insCount + delCount + updateCount;
+
+        // Determine expected diff types
+        const expectedDiffTypes: string[] = [];
+        if (insCount > 0) expectedDiffTypes.push('ins');
+        if (delCount > 0) expectedDiffTypes.push('del');
+        if (updateCount > 0) expectedDiffTypes.push('update');
+
+        // Generate fixture JSON
+        const fixture = {
+            name: '',
+            description: '',
+            category: '',
+            originalMarkdown: currentContent,
+            editedMarkdown: appliedEdits,
+            expectedStep3Output: markdownASTDiffResult,
+            expectedStep4Output: preprocessedMarkdown,
+            expectedDiffNodeCount: totalOperations,
+            expectedDiffTypes: expectedDiffTypes
+        };
+
+        const fixtureJson = JSON.stringify(fixture, null, 2);
+
+        try {
+            await navigator.clipboard.writeText(fixtureJson);
+            setFixtureExported(true);
+            console.log('Fixture exported to clipboard:', fixtureJson);
+
+            // Reset feedback after 3 seconds
+            setTimeout(() => setFixtureExported(false), 3000);
+        } catch (error) {
+            console.error('Failed to copy fixture to clipboard:', error);
+            alert('Failed to copy fixture to clipboard. Check console for the JSON.');
+        }
+    };
+
+    // Handle running the complete AI pipeline
+    const handleRunPipeline = async () => {
+        if (!currentContent.trim()) {
+            setPipelineError('No content to process');
+            return;
+        }
+
+        setIsPipelineRunning(true);
+        setPipelineError('');
+        setPipelineProgress({step: 'Starting...', progress: 0});
+
+        try {
+            const result = await getAndApplyAISuggestionsAction(
+                currentContent,
+                true, // progressCallback boolean (server actions can't use callbacks)
+                undefined // sessionData not provided here
+            );
+
+            if (result.success) {
+                console.log('✅ Pipeline completed successfully');
+                console.log('Final content:', result.content);
+
+                // Capture validation results from pipeline
+                if (result.validationResults) {
+                    setPipelineValidationResults(result.validationResults);
+                }
+            } else {
+                setPipelineError(result.error || 'Pipeline failed');
+                console.error('❌ Pipeline failed:', result.error);
+            }
+        } catch (error) {
+            setPipelineError(error instanceof Error ? error.message : 'Unexpected error occurred');
+            console.error('❌ Pipeline error:', error);
+        } finally {
+            setIsPipelineRunning(false);
+            setPipelineProgress({step: '', progress: 0});
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-white dark:bg-gray-900">
+            <main className="container mx-auto px-4 py-8">
+                <div className="text-center mb-8">
+                    <h1 className="text-4xl font-bold text-gray-900 dark:text-white mb-4">
+                        Lexical Editor Test Page
+                    </h1>
+                    <p className="text-lg text-gray-600 dark:text-gray-300 mb-4">
+                        Test the Lexical rich text editor with the story of Albert Einstein
+                    </p>
+                    {testSetName && (
+                        <p className="text-sm text-blue-600 dark:text-blue-400 mb-4">
+                            Current test set: <code>{testSetName}</code>
+                        </p>
+                    )}
+                    <div className="text-sm text-gray-500 dark:text-gray-400 max-w-2xl mx-auto">
+                        <p>Try typing in the editor below. You can use keyboard shortcuts like:</p>
+                        <ul className="mt-2 space-y-1">
+                            <li>• <strong>Ctrl+B</strong> or <strong>Cmd+B</strong> for bold text</li>
+                            <li>• <strong>Ctrl+I</strong> or <strong>Cmd+I</strong> for italic text</li>
+                            <li>• <strong>Ctrl+Z</strong> or <strong>Cmd+Z</strong> to undo</li>
+                            <li>• <strong>Ctrl+Y</strong> or <strong>Cmd+Y</strong> to redo</li>
+                        </ul>
+                        {isMarkdownMode && (
+                            <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-900/20 rounded-md border border-blue-200 dark:border-blue-800">
+                                <p className="font-medium text-blue-900 dark:text-blue-100 mb-2">Markdown Mode Active</p>
+                                <p className="text-blue-800 dark:text-blue-200 text-xs">
+                                    You can use markdown syntax: <strong>**bold**</strong>, <em>*italic*</em>, <code>`code`</code>, 
+                                    <code># heading</code>, <code>- list</code>, <code>{'>'} quote</code>
+                                </p>
+                            </div>
+                        )}
+                    </div>
+                </div>
+
+                {/* Error Display */}
+                {error && (
+                    <div className="max-w-4xl mx-auto mb-6">
+                        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md p-4">
+                            <div className="flex">
+                                <div className="flex-shrink-0">
+                                    <span className="text-red-400 text-xl">⚠️</span>
+                                </div>
+                                <div className="ml-3">
+                                    <h3 className="text-sm font-medium text-red-800 dark:text-red-200">
+                                        Error Loading Content
+                                    </h3>
+                                    <p className="mt-1 text-sm text-red-700 dark:text-red-300">
+                                        {error}
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Loaded Explanation Info */}
+                {loadedExplanationTitle && (
+                    <div className="max-w-4xl mx-auto mb-6">
+                        <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-md p-4">
+                            <div className="flex">
+                                <div className="flex-shrink-0">
+                                    <span className="text-green-400 text-xl">✅</span>
+                                </div>
+                                <div className="ml-3">
+                                    <h3 className="text-sm font-medium text-green-800 dark:text-green-200">
+                                        Explanation Loaded
+                                    </h3>
+                                    <p className="mt-1 text-sm text-green-700 dark:text-green-300">
+                                        Successfully loaded: <strong>&quot;{loadedExplanationTitle}&quot;</strong>
+                                    </p>
+                                    <p className="mt-1 text-xs text-green-600 dark:text-green-400">
+                                        Access pattern: /editorTest?explanation_id=123
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* AI Suggestion Session Info */}
+                {loadedSessionData && (
+                    <div className="max-w-4xl mx-auto mb-6">
+                        <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md p-4">
+                            <div className="flex">
+                                <div className="flex-shrink-0">
+                                    <span className="text-blue-400 text-xl">🔧</span>
+                                </div>
+                                <div className="ml-3">
+                                    <h3 className="text-sm font-medium text-blue-800 dark:text-blue-200">
+                                        AI Suggestion Session Loaded
+                                    </h3>
+                                    <p className="mt-1 text-sm text-blue-700 dark:text-blue-300">
+                                        Session: <strong>&quot;{loadedSessionData.session_metadata.user_prompt}&quot;</strong>
+                                    </p>
+                                    <p className="mt-1 text-xs text-blue-600 dark:text-blue-400">
+                                        From: {loadedSessionData.session_metadata.explanation_title} |
+                                        Steps loaded: {loadedSessionData.steps.length} |
+                                        Session ID: {loadedSessionData.session_metadata.session_id.slice(0, 8)}...
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* AI Suggestion Session Dropdown */}
+                {sessionOptions.length > 0 && (
+                    <div className="max-w-4xl mx-auto mb-6">
+                        <div className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 rounded-md p-4">
+                            <h3 className="text-sm font-medium text-indigo-800 dark:text-indigo-200 mb-3">
+                                Load AI Suggestion Session
+                            </h3>
+                            <div className="flex gap-2">
+                                <select
+                                    value={selectedSessionId || ''}
+                                    onChange={handleSessionSelection}
+                                    className="flex-1 px-3 py-2 text-sm border border-indigo-300 dark:border-indigo-600 rounded-md bg-white dark:bg-gray-800 text-indigo-900 dark:text-indigo-100"
+                                >
+                                    <option value="">Select AI suggestion session...</option>
+                                    {sessionOptions.map((session) => (
+                                        <option key={session.session_id} value={session.session_id}>
+                                            &quot;{session.user_prompt}&quot; - {session.explanation_title} ({new Date(session.created_at).toLocaleDateString()})
+                                        </option>
+                                    ))}
+                                </select>
+                                <button
+                                    onClick={() => loadSessionOptions()}
+                                    className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm rounded-md transition-colors"
+                                    title="Refresh session list"
+                                >
+                                    🔄
+                                </button>
+                            </div>
+                            <p className="mt-2 text-xs text-indigo-600 dark:text-indigo-400">
+                                Load a complete AI suggestion session with all 4 pipeline steps. This will replace current content.
+                            </p>
+                        </div>
+                    </div>
+                )}
+
+                {/* Pipeline Validation Summary Dashboard */}
+                <ValidationSummaryDashboard
+                    results={pipelineValidationResults}
+                    step4Result={validationErrors.length > 0 ? {
+                        valid: false,
+                        issues: validationErrors,
+                        severity: 'warning' as const,
+                    } : preprocessedMarkdown ? {
+                        valid: true,
+                        issues: [],
+                        severity: 'warning' as const,
+                    } : undefined}
+                />
+
+                {/* Validation Checks Table - shows all checks with status and descriptions */}
+                <ValidationChecksTable
+                    results={pipelineValidationResults}
+                    step4Result={validationErrors.length > 0 ? {
+                        valid: false,
+                        issues: validationErrors,
+                        severity: 'warning' as const,
+                    } : preprocessedMarkdown ? {
+                        valid: true,
+                        issues: [],
+                        severity: 'warning' as const,
+                    } : undefined}
+                />
+
+                <div className="max-w-4xl mx-auto space-y-6">
+                    {/* Main Editor */}
+                    <div className="bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700">
+                        <div className="p-6">
+                            <div className="flex justify-between items-center mb-2">
+                                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                                    Rich Text Editor
+                                </label>
+                                <div className="flex items-center space-x-2">
+                                    <span className="text-sm text-gray-600 dark:text-gray-400">Raw Text</span>
+                                    <button
+                                        onClick={handleMarkdownToggle}
+                                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
+                                            isMarkdownMode 
+                                                ? 'bg-blue-600' 
+                                                : 'bg-gray-200 dark:bg-gray-700'
+                                        }`}
+                                    >
+                                        <span
+                                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                                isMarkdownMode ? 'translate-x-6' : 'translate-x-1'
+                                            }`}
+                                        />
+                                    </button>
+                                    <span className="text-sm text-gray-600 dark:text-gray-400">Markdown</span>
+                                </div>
+                            </div>
+                            <div className="flex justify-between items-center mb-2">
+                                <div className="flex-1"></div>
+                                <EditModeToggle isEditMode={isEditMode} onToggle={toggleEditMode} />
+                            </div>
+                            <LexicalEditor
+                                ref={editorRef}
+                                placeholder="Start writing your story about Albert Einstein or any other topic..."
+                                className="w-full"
+                                initialContent={defaultContent}
+                                isMarkdownMode={isMarkdownMode}
+                                isEditMode={isEditMode}
+                                onContentChange={(content) => {
+                                    console.log('Content changed:', content.length, 'characters');
+                                    setCurrentContent(content);
+                                }}
+                            />
+                        </div>
+                    </div>
+
+                    {/* Complete AI Pipeline */}
+                    <div className="bg-purple-50 dark:bg-purple-900/20 rounded-lg border border-purple-200 dark:border-purple-800">
+                        <div className="p-6">
+                            <h3 className="text-lg font-semibold text-purple-900 dark:text-purple-100 mb-3">
+                                Complete AI Pipeline (4.1)
+                            </h3>
+                            <div className="text-purple-800 dark:text-purple-200 text-sm space-y-4">
+                                <p>
+                                    Run the complete 4-step AI pipeline: Generate suggestions → Apply edits → Create diff → Apply to editor.
+                                </p>
+
+                                <div className="flex gap-2 items-center">
+                                    <button
+                                        onClick={handleRunPipeline}
+                                        disabled={isPipelineRunning || !currentContent.trim()}
+                                        className={`px-4 py-2 rounded-md font-medium transition-colors ${
+                                            isPipelineRunning || !currentContent.trim()
+                                                ? 'bg-gray-400 text-white cursor-not-allowed'
+                                                : 'bg-purple-600 hover:bg-purple-700 text-white'
+                                        }`}
+                                    >
+                                        {isPipelineRunning ? 'Running Pipeline...' : 'Run Complete AI Pipeline'}
+                                    </button>
+
+                                    {isPipelineRunning && (
+                                        <div className="flex items-center space-x-2">
+                                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-purple-600"></div>
+                                            <span className="text-sm text-purple-600 dark:text-purple-400">
+                                                {pipelineProgress.step} ({pipelineProgress.progress}%)
+                                            </span>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {pipelineError && (
+                                    <div className="mt-4 p-3 bg-red-100 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
+                                        <p className="text-red-800 dark:text-red-200 text-sm">
+                                            Error: {pipelineError}
+                                        </p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* AI Suggestions Panel */}
+                    <div className="bg-orange-50 dark:bg-orange-900/20 rounded-lg border border-orange-200 dark:border-orange-800">
+                        <div className="p-6">
+                            <h3 className="text-lg font-semibold text-orange-900 dark:text-orange-100 mb-3">
+                                AI Suggestions
+                            </h3>
+                            <div className="text-orange-800 dark:text-orange-200 text-sm space-y-4">
+                                <p>
+                                    Get AI-powered suggestions to improve your content. The AI will suggest edits with clear instructions.
+                                </p>
+                                
+                                <div className="flex flex-wrap gap-2 items-end">
+                                    <div className="flex-grow">
+                                        <div className="text-xs text-orange-600 dark:text-orange-400 mb-2">
+                                            Content length: {currentContent.length} characters |
+                                            Button disabled: {isLoadingSuggestions ? 'Yes (loading)' : 'No'}
+                                        </div>
+                                        <button
+                                            onClick={handleGetAISuggestions}
+                                            disabled={isLoadingSuggestions}
+                                            className={`px-4 py-2 rounded-md font-medium transition-colors ${
+                                                isLoadingSuggestions
+                                                    ? 'bg-orange-300 text-white cursor-not-allowed'
+                                                    : 'bg-orange-600 hover:bg-orange-700 text-white'
+                                            }`}
+                                        >
+                                            {isLoadingSuggestions ? 'Processing...' : 'Get AI Suggestions'}
+                                        </button>
+                                    </div>
+                                    <div className="flex flex-col">
+                                        <label className="text-xs text-orange-600 dark:text-orange-400 mb-1">
+                                            Load from database:
+                                        </label>
+                                        <div className="flex gap-1">
+                                            <select
+                                                onChange={handleStep1Selection}
+                                                className="px-3 py-2 text-sm border border-orange-300 dark:border-orange-600 rounded-md bg-white dark:bg-gray-800 text-orange-900 dark:text-orange-100"
+                                                defaultValue=""
+                                            >
+                                                <option value="">Select previous result...</option>
+                                                {step1Options.map((option) => (
+                                                    <option key={option.id} value={option.id}>
+                                                        {option.name} ({new Date(option.created_at).toLocaleDateString()})
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                onClick={() => handleRenameStep(1, selectedStep1Id)}
+                                                disabled={!selectedStep1Id}
+                                                className={`px-2 py-2 text-sm rounded-md transition-colors ${
+                                                    selectedStep1Id
+                                                        ? 'bg-orange-600 hover:bg-orange-700 text-white'
+                                                        : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                                                }`}
+                                                title="Rename selected item"
+                                            >
+                                                ✏️
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {suggestionError && (
+                                    <div className="mt-4 p-3 bg-red-100 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
+                                        <p className="text-red-800 dark:text-red-200 text-sm">
+                                            Error: {suggestionError}
+                                        </p>
+                                    </div>
+                                )}
+
+                                {rawAIResponse && (
+                                    <div className="mt-4">
+                                        <h4 className="font-semibold text-orange-900 dark:text-orange-100 mb-2">
+                                            Raw AI Response (JSON):
+                                        </h4>
+                                        <div className="bg-white dark:bg-gray-800 rounded-md p-4 border border-orange-300 dark:border-orange-600">
+                                            <pre className="text-sm text-orange-900 dark:text-orange-100 whitespace-pre-wrap font-mono">
+                                                {rawAIResponse}
+                                            </pre>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {aiSuggestions && (
+                                    <div className="mt-4">
+                                        <h4 className="font-semibold text-orange-900 dark:text-orange-100 mb-2">
+                                            Formatted AI Suggestions:
+                                        </h4>
+                                        <div className="bg-white dark:bg-gray-800 rounded-md p-4 border border-orange-300 dark:border-orange-600">
+                                            <pre className="text-sm text-orange-900 dark:text-orange-100 whitespace-pre-wrap font-mono">
+                                                {aiSuggestions}
+                                            </pre>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Edits Applied Panel */}
+                    <div className="bg-green-50 dark:bg-green-900/20 rounded-lg border border-green-200 dark:border-green-800">
+                        <div className="p-6">
+                            <h3 className="text-lg font-semibold text-green-900 dark:text-green-100 mb-3 flex items-center gap-3">
+                                Edits Applied
+                                <ValidationStatusBadge
+                                    result={pipelineValidationResults.step2}
+                                    stepName="B2: Content Preservation"
+                                />
+                            </h3>
+                            <div className="text-green-800 dark:text-green-200 text-sm space-y-4">
+                                <p>
+                                    Apply the AI suggestions to your content to see the improved version.
+                                </p>
+                                <p className="text-xs text-green-600 dark:text-green-400 italic">
+                                    Validation (B2): Checks length ratio (50-200%), heading retention (&gt;50%), no unexpanded markers
+                                </p>
+
+                                <div className="flex flex-wrap gap-2 items-end">
+                                    <div className="flex-grow">
+                                        <button
+                                            onClick={handleApplyAISuggestions}
+                                            disabled={!aiSuggestions || isApplyingEdits}
+                                            className={`px-4 py-2 rounded-md font-medium transition-colors ${
+                                                !aiSuggestions || isApplyingEdits
+                                                    ? 'bg-gray-400 text-white cursor-not-allowed'
+                                                    : 'bg-green-600 hover:bg-green-700 text-white'
+                                            }`}
+                                        >
+                                            {isApplyingEdits ? 'Applying...' : 'Apply AI Suggestions'}
+                                        </button>
+                                    </div>
+                                    <div className="flex flex-col">
+                                        <label className="text-xs text-green-600 dark:text-green-400 mb-1">
+                                            Load from database:
+                                        </label>
+                                        <div className="flex gap-1">
+                                            <select
+                                                onChange={handleStep2Selection}
+                                                className="px-3 py-2 text-sm border border-green-300 dark:border-green-600 rounded-md bg-white dark:bg-gray-800 text-green-900 dark:text-green-100"
+                                                defaultValue=""
+                                            >
+                                                <option value="">Select previous result...</option>
+                                                {step2Options.map((option) => (
+                                                    <option key={option.id} value={option.id}>
+                                                        {option.name} ({new Date(option.created_at).toLocaleDateString()})
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                onClick={() => handleRenameStep(2, selectedStep2Id)}
+                                                disabled={!selectedStep2Id}
+                                                className={`px-2 py-2 text-sm rounded-md transition-colors ${
+                                                    selectedStep2Id
+                                                        ? 'bg-green-600 hover:bg-green-700 text-white'
+                                                        : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                                                }`}
+                                                title="Rename selected item"
+                                            >
+                                                ✏️
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {applyError && (
+                                    <div className="mt-4 p-3 bg-red-100 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
+                                        <p className="text-red-800 dark:text-red-200 text-sm">
+                                            Error: {applyError}
+                                        </p>
+                                    </div>
+                                )}
+
+                                {appliedEdits && (
+                                    <div className="mt-4">
+                                        <h4 className="font-semibold text-green-900 dark:text-green-100 mb-2">
+                                            Result:
+                                        </h4>
+                                        <div className="bg-white dark:bg-gray-800 rounded-md p-4 border border-green-300 dark:border-green-600">
+                                            <pre className="text-sm text-green-900 dark:text-green-100 whitespace-pre-wrap font-mono">
+                                                {appliedEdits}
+                                            </pre>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Diff Applied Panel */}
+                    <div className="bg-purple-50 dark:bg-purple-900/20 rounded-lg border border-purple-200 dark:border-purple-800">
+                        <div className="p-6">
+                            <h3 className="text-lg font-semibold text-purple-900 dark:text-purple-100 mb-3 flex items-center gap-3">
+                                Diff Applied
+                                <ValidationStatusBadge
+                                    result={pipelineValidationResults.step3}
+                                    stepName="B3: CriticMarkup Syntax"
+                                />
+                            </h3>
+                            <div className="text-purple-800 dark:text-purple-200 text-sm space-y-4">
+                                <p>
+                                    Apply a diff between the original content and the applied edits using markdown AST diff.
+                                </p>
+                                <p className="text-xs text-purple-600 dark:text-purple-400 italic">
+                                    Validation (B3): Checks balanced CriticMarkup markers: {`{++ ++}`}, {`{-- --}`}, {`{~~ ~> ~~}`}
+                                </p>
+
+                                <div className="flex flex-wrap gap-2 items-end">
+                                    <div className="flex-grow">
+                                        <div className="text-xs text-purple-600 dark:text-purple-400 mb-2">
+                                            Original content: {currentContent.length} characters |
+                                            Applied edits: {appliedEdits.length} characters |
+                                            Method: Markdown AST |
+                                            Apply Diff disabled: {isApplyingDiff ? 'Yes (processing)' : 'No'}
+                                        </div>
+                                        <button
+                                            onClick={handleApplyDiff}
+                                            disabled={
+                                                !currentContent ||
+                                                !appliedEdits ||
+                                                isApplyingDiff ||
+                                                (pipelineValidationResults.step2?.severity === 'error' && !pipelineValidationResults.step2?.valid)
+                                            }
+                                            className={`px-4 py-2 rounded-md font-medium transition-colors ${
+                                                !currentContent || !appliedEdits || isApplyingDiff ||
+                                                (pipelineValidationResults.step2?.severity === 'error' && !pipelineValidationResults.step2?.valid)
+                                                    ? 'bg-purple-300 text-white cursor-not-allowed'
+                                                    : 'bg-purple-600 hover:bg-purple-700 text-white'
+                                            }`}
+                                        >
+                                            {isApplyingDiff ? 'Processing...' : 'Apply Diff'}
+                                        </button>
+                                        {pipelineValidationResults.step2?.severity === 'error' && !pipelineValidationResults.step2?.valid && (
+                                            <p className="text-xs text-red-600 dark:text-red-400 mt-2">
+                                                Step 3 blocked: Step 2 validation failed with error-severity issues.
+                                            </p>
+                                        )}
+                                    </div>
+                                    <div className="flex flex-col">
+                                        <label className="text-xs text-purple-600 dark:text-purple-400 mb-1">
+                                            Load from database:
+                                        </label>
+                                        <div className="flex gap-1">
+                                            <select
+                                                onChange={handleStep3Selection}
+                                                className="px-3 py-2 text-sm border border-purple-300 dark:border-purple-600 rounded-md bg-white dark:bg-gray-800 text-purple-900 dark:text-purple-100"
+                                                defaultValue=""
+                                            >
+                                                <option value="">Select previous result...</option>
+                                                {step3Options.map((option) => (
+                                                    <option key={option.id} value={option.id}>
+                                                        {option.name} ({new Date(option.created_at).toLocaleDateString()})
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                onClick={() => handleRenameStep(3, selectedStep3Id)}
+                                                disabled={!selectedStep3Id}
+                                                className={`px-2 py-2 text-sm rounded-md transition-colors ${
+                                                    selectedStep3Id
+                                                        ? 'bg-purple-600 hover:bg-purple-700 text-white'
+                                                        : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                                                }`}
+                                                title="Rename selected item"
+                                            >
+                                                ✏️
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {diffError && (
+                                    <div className="mt-4 p-3 bg-red-100 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
+                                        <p className="text-red-800 dark:text-red-200 text-sm">
+                                            Error: {diffError}
+                                        </p>
+                                    </div>
+                                )}
+
+                                {markdownASTDiffResult && (
+                                    <div className="mt-4 space-y-4">
+                                        <div>
+                                            <h4 className="font-semibold text-purple-900 dark:text-purple-100 mb-2">
+                                                Raw Markdown (CriticMarkup):
+                                            </h4>
+                                            <div className="bg-white dark:bg-gray-800 rounded-md p-4 border border-purple-300 dark:border-purple-600">
+                                                <pre className="text-sm text-purple-900 dark:text-purple-100 whitespace-pre-wrap font-mono">
+                                                    {markdownASTDiffResult}
+                                                </pre>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Preprocessed Panel */}
+                    <div className="bg-orange-50 dark:bg-orange-900/20 rounded-lg border border-orange-200 dark:border-orange-800">
+                        <div className="p-6">
+                            <h3 className="text-lg font-semibold text-orange-900 dark:text-orange-100 mb-3 flex items-center gap-3">
+                                Preprocessed
+                                <ValidationStatusBadge
+                                    result={validationErrors.length > 0 ? {
+                                        valid: false,
+                                        issues: validationErrors,
+                                        severity: 'warning' as const,
+                                        description: VALIDATION_DESCRIPTIONS.step4,
+                                    } : preprocessedMarkdown ? {
+                                        valid: true,
+                                        issues: [],
+                                        severity: 'warning' as const,
+                                        description: VALIDATION_DESCRIPTIONS.step4,
+                                    } : undefined}
+                                    stepName="Step4: Heading Format"
+                                />
+                            </h3>
+                            <div className="text-orange-800 dark:text-orange-200 text-sm space-y-4">
+                                <p>
+                                    Apply preprocessing to normalize multiline patterns and fix formatting issues.
+                                </p>
+                                <p className="text-xs text-orange-600 dark:text-orange-400 italic">
+                                    Validation (Step4): Checks headings start on newlines, CriticMarkup blocks with headings are formatted
+                                </p>
+
+                                <div className="flex flex-wrap gap-2 items-end">
+                                    <div className="flex-grow">
+                                        <button
+                                            onClick={handlePreprocessing}
+                                            disabled={
+                                                !markdownASTDiffResult ||
+                                                isPreprocessing ||
+                                                (pipelineValidationResults.step3?.severity === 'error' && !pipelineValidationResults.step3?.valid)
+                                            }
+                                            className={`px-4 py-2 rounded-md font-medium transition-colors ${
+                                                !markdownASTDiffResult || isPreprocessing ||
+                                                (pipelineValidationResults.step3?.severity === 'error' && !pipelineValidationResults.step3?.valid)
+                                                    ? 'bg-gray-400 text-white cursor-not-allowed'
+                                                    : 'bg-orange-600 hover:bg-orange-700 text-white'
+                                            }`}
+                                        >
+                                            {isPreprocessing ? 'Preprocessing...' : 'Apply Preprocessing'}
+                                        </button>
+                                        {pipelineValidationResults.step3?.severity === 'error' && !pipelineValidationResults.step3?.valid && (
+                                            <p className="text-xs text-red-600 dark:text-red-400 mt-2">
+                                                Step 4 blocked: Step 3 validation failed with error-severity issues.
+                                            </p>
+                                        )}
+                                    </div>
+                                    <div className="flex flex-col">
+                                        <label className="text-xs text-orange-600 dark:text-orange-400 mb-1">
+                                            Load from database:
+                                        </label>
+                                        <div className="flex gap-1">
+                                            <select
+                                                onChange={handleStep4Selection}
+                                                className="px-3 py-2 text-sm border border-orange-300 dark:border-orange-600 rounded-md bg-white dark:bg-gray-800 text-orange-900 dark:text-orange-100"
+                                                defaultValue=""
+                                            >
+                                                <option value="">Select previous result...</option>
+                                                {step4Options.map((option) => (
+                                                    <option key={option.id} value={option.id}>
+                                                        {option.name} ({new Date(option.created_at).toLocaleDateString()})
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                onClick={() => handleRenameStep(4, selectedStep4Id)}
+                                                disabled={!selectedStep4Id}
+                                                className={`px-2 py-2 text-sm rounded-md transition-colors ${
+                                                    selectedStep4Id
+                                                        ? 'bg-orange-600 hover:bg-orange-700 text-white'
+                                                        : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                                                }`}
+                                                title="Rename selected item"
+                                            >
+                                                ✏️
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {preprocessingError && (
+                                    <div className="mt-4 p-3 bg-red-100 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
+                                        <p className="text-red-800 dark:text-red-200 text-sm">
+                                            Error: {preprocessingError}
+                                        </p>
+                                    </div>
+                                )}
+
+                                {validationErrors.length > 0 && (
+                                    <div className="mt-4 p-4 bg-red-100 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
+                                        <div className="flex items-start">
+                                            <div className="flex-shrink-0">
+                                                <span className="text-red-600 dark:text-red-400 text-lg">⚠️</span>
+                                            </div>
+                                            <div className="ml-3">
+                                                <h4 className="text-sm font-medium text-red-800 dark:text-red-200 mb-2">
+                                                    Heading Validation Errors
+                                                </h4>
+                                                <div className="text-red-700 dark:text-red-300 text-sm">
+                                                    <p className="mb-2">The following heading formatting issues were found:</p>
+                                                    <ul className="list-disc list-inside space-y-1">
+                                                        {validationErrors.map((error, index) => (
+                                                            <li key={index}>{error}</li>
+                                                        ))}
+                                                    </ul>
+                                                    <p className="mt-3 text-xs text-red-600 dark:text-red-400">
+                                                        <strong>Requirements:</strong> All headings (not in CriticMarkup) and CriticMarkup containing headings must start on a new line.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {preprocessedMarkdown && (
+                                    <div className="mt-4">
+                                        <h4 className="font-semibold text-orange-900 dark:text-orange-100 mb-2">
+                                            Result:
+                                        </h4>
+                                        <div className="bg-white dark:bg-gray-800 rounded-md p-4 border border-orange-300 dark:border-orange-600">
+                                            <pre className="text-sm text-orange-900 dark:text-orange-100 whitespace-pre-wrap font-mono">
+                                                {preprocessedMarkdown}
+                                            </pre>
+                                        </div>
+
+                                        <div className="mt-4 flex flex-wrap gap-2 items-center">
+                                            <button
+                                                onClick={handleUpdateEditorWithMarkdown}
+                                                disabled={!preprocessedMarkdown}
+                                                className={`px-4 py-2 rounded-md font-medium transition-colors ${
+                                                    !preprocessedMarkdown
+                                                        ? 'bg-gray-400 text-white cursor-not-allowed'
+                                                        : 'bg-blue-600 hover:bg-blue-700 text-white'
+                                                }`}
+                                            >
+                                                Update Editor Window with Markdown
+                                            </button>
+                                            <button
+                                                onClick={handleExportAsFixture}
+                                                disabled={!currentContent || !appliedEdits || !markdownASTDiffResult || !preprocessedMarkdown}
+                                                className={`px-4 py-2 rounded-md font-medium transition-colors ${
+                                                    !currentContent || !appliedEdits || !markdownASTDiffResult || !preprocessedMarkdown
+                                                        ? 'bg-gray-400 text-white cursor-not-allowed'
+                                                        : 'bg-green-600 hover:bg-green-700 text-white'
+                                                }`}
+                                            >
+                                                {fixtureExported ? 'Copied to Clipboard!' : 'Export as Fixture'}
+                                            </button>
+                                        </div>
+                                        {fixtureExported && (
+                                            <p className="mt-2 text-xs text-green-600 dark:text-green-400">
+                                                Fixture JSON copied! Paste into editor-test-helpers.ts AI_PIPELINE_FIXTURES.
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Instructions Panel */}
+                    <div className="bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-200 dark:border-blue-800">
+                        <div className="p-6">
+                            <h3 className="text-lg font-semibold text-blue-900 dark:text-blue-100 mb-3">
+                                About This Editor
+                            </h3>
+                            <div className="text-blue-800 dark:text-blue-200 text-sm space-y-2">
+                                <p>
+                                    This is a <strong>Lexical</strong> rich text editor - a modern, extensible text editor framework 
+                                    developed by Meta (Facebook). It provides a robust foundation for building rich text editing experiences.
+                                </p>
+                                <p>
+                                    The editor supports rich text formatting, undo/redo functionality, and is designed to be 
+                                    highly customizable and performant. It now includes AI suggestions powered by GPT-4o-mini.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    );
+}
+
+export default function EditorTestPage() {
+    return (
+        <Suspense fallback={<div className="min-h-screen bg-white dark:bg-gray-900 flex items-center justify-center">
+            <div className="flex space-x-1">
+                <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce"></div>
+                <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+                <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+            </div>
+        </div>}>
+            <EditorTestPageContent />
+        </Suspense>
+    );
+}

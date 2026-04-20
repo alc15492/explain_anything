@@ -1,0 +1,830 @@
+/**
+ * Tests for aiSuggestion.ts (Phase 7D)
+ * Tests AI suggestion schema validation, prompt generation, and output processing
+ */
+
+import {
+  aiSuggestionSchema,
+  createAISuggestionPrompt,
+  createApplyEditsPrompt,
+  mergeAISuggestionOutput,
+  validateAISuggestionOutput,
+  formatSourcesForPrompt,
+  type AISuggestionOutput,
+} from './aiSuggestion';
+import type { SourceChipType } from '@/lib/schemas/schemas';
+
+// Mock getOrCreateCachedSource
+jest.mock('@/lib/services/sourceCache', () => ({
+  getOrCreateCachedSource: jest.fn(),
+}));
+
+// ============= Schema Validation Tests =============
+
+describe('aiSuggestionSchema - Validation Rules', () => {
+  it('should accept valid alternating pattern starting with content', () => {
+    const valid = {
+      edits: ['Content 1', '... existing text ...', 'Content 2'],
+    };
+
+    const result = aiSuggestionSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should accept valid alternating pattern ending with marker', () => {
+    const valid = {
+      edits: ['Content 1', '... existing text ...', 'Content 2', '... existing text ...'],
+    };
+
+    const result = aiSuggestionSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should accept single content item', () => {
+    const valid = {
+      edits: ['Single content piece'],
+    };
+
+    const result = aiSuggestionSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject empty edits array', () => {
+    const invalid = {
+      edits: [],
+    };
+
+    const result = aiSuggestionSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject pattern starting with marker at even index', () => {
+    const invalid = {
+      edits: ['... existing text ...', 'Content 1'],
+    };
+
+    const result = aiSuggestionSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject two consecutive content items', () => {
+    const invalid = {
+      edits: ['Content 1', 'Content 2'],
+    };
+
+    const result = aiSuggestionSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject two consecutive markers', () => {
+    const invalid = {
+      edits: ['Content 1', '... existing text ...', '... existing text ...'],
+    };
+
+    const result = aiSuggestionSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should accept complex valid pattern', () => {
+    const valid = {
+      edits: [
+        'Introduction edited',
+        '... existing text ...',
+        'Middle section edited',
+        '... existing text ...',
+        'Conclusion edited',
+      ],
+    };
+
+    const result = aiSuggestionSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject missing edits property', () => {
+    const invalid = {};
+
+    const result = aiSuggestionSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject non-array edits', () => {
+    const invalid = {
+      edits: 'not an array',
+    };
+
+    const result = aiSuggestionSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject non-string array items', () => {
+    const invalid = {
+      edits: [123, '... existing text ...'],
+    };
+
+    const result = aiSuggestionSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+});
+
+// ============= Prompt Generation Tests =============
+
+describe('createAISuggestionPrompt - Prompt Generation', () => {
+  const defaultUserPrompt = 'Improve the content';
+
+  it('should include current text in prompt', () => {
+    const text = 'This is the original content';
+    const prompt = createAISuggestionPrompt(text, defaultUserPrompt);
+
+    expect(prompt).toContain(text);
+  });
+
+  it('should include output format instructions', () => {
+    const prompt = createAISuggestionPrompt('test content', defaultUserPrompt);
+
+    expect(prompt).toContain('<output_format>');
+    expect(prompt).toContain('JSON object');
+    expect(prompt).toContain('edits');
+  });
+
+  it('should include rules section', () => {
+    const prompt = createAISuggestionPrompt('test content', defaultUserPrompt);
+
+    expect(prompt).toContain('<rules>');
+    expect(prompt).toContain('... existing text ...');
+  });
+
+  it('should include example', () => {
+    const prompt = createAISuggestionPrompt('test content', defaultUserPrompt);
+
+    expect(prompt).toContain('Example:');
+    expect(prompt).toContain('"edits"');
+  });
+
+  it('should handle empty content', () => {
+    const prompt = createAISuggestionPrompt('', defaultUserPrompt);
+
+    expect(prompt).toBeTruthy();
+    expect(prompt.length).toBeGreaterThan(100); // Should have template text
+  });
+
+  it('should handle multiline content', () => {
+    const text = 'Line 1\nLine 2\nLine 3';
+    const prompt = createAISuggestionPrompt(text, defaultUserPrompt);
+
+    expect(prompt).toContain(text);
+  });
+
+  it('should handle special characters in content', () => {
+    const text = 'Content with "quotes" and <tags>';
+    const prompt = createAISuggestionPrompt(text, defaultUserPrompt);
+
+    expect(prompt).toContain(text);
+  });
+
+  it('should maintain consistent prompt structure', () => {
+    const prompt1 = createAISuggestionPrompt('content 1', defaultUserPrompt);
+    const prompt2 = createAISuggestionPrompt('content 2', defaultUserPrompt);
+
+    // Both should have same structure, different content
+    expect(prompt1).toContain('<output_format>');
+    expect(prompt2).toContain('<output_format>');
+    expect(prompt1).toContain('<rules>');
+    expect(prompt2).toContain('<rules>');
+  });
+});
+
+describe('createApplyEditsPrompt - Apply Edits Prompt', () => {
+  it('should include AI suggestions', () => {
+    const suggestions = 'Edited content\n... existing text ...';
+    const original = 'Original content';
+    const prompt = createApplyEditsPrompt(suggestions, original);
+
+    expect(prompt).toContain(suggestions);
+  });
+
+  it('should include original content', () => {
+    const suggestions = 'Edited content';
+    const original = 'Original content here';
+    const prompt = createApplyEditsPrompt(suggestions, original);
+
+    expect(prompt).toContain(original);
+  });
+
+  it('should include instructions', () => {
+    const prompt = createApplyEditsPrompt('suggestions', 'original');
+
+    expect(prompt).toContain('IMPORTANT RULES');
+    expect(prompt).toContain('Apply');
+  });
+
+  it('should include markers explanation', () => {
+    const prompt = createApplyEditsPrompt('suggestions', 'original');
+
+    expect(prompt).toContain('... existing text ...');
+  });
+
+  it('should separate suggestions and original content', () => {
+    const prompt = createApplyEditsPrompt('suggestions', 'original');
+
+    expect(prompt).toContain('== AI SUGGESTIONS ==');
+    expect(prompt).toContain('== ORIGINAL CONTENT ==');
+  });
+
+  it('should handle empty suggestions', () => {
+    const prompt = createApplyEditsPrompt('', 'original content');
+
+    expect(prompt).toBeTruthy();
+    expect(prompt).toContain('original content');
+  });
+
+  it('should handle empty original content', () => {
+    const prompt = createApplyEditsPrompt('suggestions', '');
+
+    expect(prompt).toBeTruthy();
+    expect(prompt).toContain('suggestions');
+  });
+});
+
+// ============= Output Processing Tests =============
+
+describe('mergeAISuggestionOutput - Output Merging', () => {
+  it('should merge single item', () => {
+    const output: AISuggestionOutput = {
+      edits: ['Single content'],
+    };
+
+    const result = mergeAISuggestionOutput(output);
+
+    expect(result).toBe('Single content');
+  });
+
+  it('should merge multiple items with newlines', () => {
+    const output: AISuggestionOutput = {
+      edits: ['Content 1', '... existing text ...', 'Content 2'],
+    };
+
+    const result = mergeAISuggestionOutput(output);
+
+    expect(result).toBe('Content 1\n... existing text ...\nContent 2');
+  });
+
+  it('should handle empty array edge case', () => {
+    const output = { edits: [] } as any;
+
+    const result = mergeAISuggestionOutput(output);
+
+    expect(result).toBe('');
+  });
+
+  it('should preserve multiline content within items', () => {
+    const output: AISuggestionOutput = {
+      edits: ['Line 1\nLine 2', '... existing text ...'],
+    };
+
+    const result = mergeAISuggestionOutput(output);
+
+    expect(result).toContain('Line 1\nLine 2');
+  });
+
+  it('should handle special characters', () => {
+    const output: AISuggestionOutput = {
+      edits: ['Content with "quotes"', '... existing text ...', 'Content with <tags>'],
+    };
+
+    const result = mergeAISuggestionOutput(output);
+
+    expect(result).toContain('"quotes"');
+    expect(result).toContain('<tags>');
+  });
+
+  it('should maintain order of edits', () => {
+    const output: AISuggestionOutput = {
+      edits: ['First', 'Second', 'Third'],
+    };
+
+    const result = mergeAISuggestionOutput(output);
+
+    expect(result).toBe('First\nSecond\nThird');
+    expect(result.indexOf('First')).toBeLessThan(result.indexOf('Second'));
+    expect(result.indexOf('Second')).toBeLessThan(result.indexOf('Third'));
+  });
+});
+
+// ============= Output Validation Tests =============
+
+describe('validateAISuggestionOutput - Validation Function', () => {
+  it('should validate correct JSON string', () => {
+    const validJSON = JSON.stringify({
+      edits: ['Content 1', '... existing text ...', 'Content 2'],
+    });
+
+    const result = validateAISuggestionOutput(validJSON);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.edits).toHaveLength(3);
+    }
+  });
+
+  it('should reject invalid JSON', () => {
+    const invalidJSON = 'not valid json {';
+
+    const result = validateAISuggestionOutput(invalidJSON);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]!.message).toContain('Invalid JSON');
+    }
+  });
+
+  it('should reject valid JSON with invalid schema', () => {
+    const invalidSchema = JSON.stringify({
+      edits: ['... existing text ...', 'Content'],
+    });
+
+    const result = validateAISuggestionOutput(invalidSchema);
+
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject empty edits array', () => {
+    const emptyEdits = JSON.stringify({
+      edits: [],
+    });
+
+    const result = validateAISuggestionOutput(emptyEdits);
+
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject missing edits property', () => {
+    const missingEdits = JSON.stringify({
+      other: 'property',
+    });
+
+    const result = validateAISuggestionOutput(missingEdits);
+
+    expect(result.success).toBe(false);
+  });
+
+  it('should handle valid complex pattern', () => {
+    const complexValid = JSON.stringify({
+      edits: [
+        'Introduction',
+        '... existing text ...',
+        'Middle section',
+        '... existing text ...',
+        'Conclusion',
+      ],
+    });
+
+    const result = validateAISuggestionOutput(complexValid);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.edits).toHaveLength(5);
+    }
+  });
+
+  it('should return error for consecutive content items', () => {
+    const consecutive = JSON.stringify({
+      edits: ['Content 1', 'Content 2'],
+    });
+
+    const result = validateAISuggestionOutput(consecutive);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toBeDefined();
+    }
+  });
+
+  it('should handle whitespace in JSON', () => {
+    const withWhitespace = `
+      {
+        "edits": [
+          "Content 1",
+          "... existing text ...",
+          "Content 2"
+        ]
+      }
+    `;
+
+    const result = validateAISuggestionOutput(withWhitespace);
+
+    expect(result.success).toBe(true);
+  });
+
+  it('should preserve data structure on success', () => {
+    const validJSON = JSON.stringify({
+      edits: ['Test content', '... existing text ...', 'More content'],
+    });
+
+    const result = validateAISuggestionOutput(validJSON);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.edits[0]).toBe('Test content');
+      expect(result.data.edits[1]).toBe('... existing text ...');
+      expect(result.data.edits[2]).toBe('More content');
+    }
+  });
+});
+
+// ============= Edge Cases & Error Handling =============
+
+describe('aiSuggestion - Edge Cases', () => {
+  const defaultUserPrompt = 'Improve the content';
+
+  it('should handle very long content in prompts', () => {
+    const longContent = 'A'.repeat(10000);
+    const prompt = createAISuggestionPrompt(longContent, defaultUserPrompt);
+
+    expect(prompt).toContain(longContent);
+    expect(prompt.length).toBeGreaterThan(10000);
+  });
+
+  it('should handle unicode characters in content', () => {
+    const unicode = '你好世界 🌍 Здравствуй мир';
+    const prompt = createAISuggestionPrompt(unicode, defaultUserPrompt);
+
+    expect(prompt).toContain(unicode);
+  });
+
+  it('should handle markdown formatting in suggestions', () => {
+    const output: AISuggestionOutput = {
+      edits: ['**Bold** text', '... existing text ...', '*Italic* text'],
+    };
+
+    const merged = mergeAISuggestionOutput(output);
+
+    expect(merged).toContain('**Bold**');
+    expect(merged).toContain('*Italic*');
+  });
+
+  it('should handle code blocks in content', () => {
+    const codeContent = '```javascript\nconst x = 1;\n```';
+    const prompt = createAISuggestionPrompt(codeContent, defaultUserPrompt);
+
+    expect(prompt).toContain(codeContent);
+  });
+
+  it('should validate nested JSON structures gracefully', () => {
+    const nestedJSON = JSON.stringify({
+      edits: ['Content'],
+      nested: { prop: 'value' },
+    });
+
+    const result = validateAISuggestionOutput(nestedJSON);
+
+    // Should succeed if edits array is valid, ignore extra properties
+    expect(result.success).toBe(true);
+  });
+});
+
+// ============= Source Integration Tests (Phase 0) =============
+
+describe('createAISuggestionPrompt - Source Integration', () => {
+  const defaultUserPrompt = 'Improve the content';
+  const sampleContent = 'Test article content';
+
+  it('should work without sources (backward compatible)', () => {
+    const prompt = createAISuggestionPrompt(sampleContent, defaultUserPrompt);
+
+    expect(prompt).toContain(sampleContent);
+    expect(prompt).toContain(defaultUserPrompt);
+    expect(prompt).not.toContain('Reference Sources');
+    expect(prompt).not.toContain('[Source');
+  });
+
+  it('should include sources when provided', () => {
+    const sources = [
+      {
+        index: 1,
+        title: 'Example Article',
+        domain: 'example.com',
+        content: 'This is source content.',
+        isVerbatim: true,
+      },
+    ];
+
+    const prompt = createAISuggestionPrompt(sampleContent, defaultUserPrompt, sources);
+
+    expect(prompt).toContain('## Reference Sources');
+    expect(prompt).toContain('[Source 1] Example Article (example.com) [VERBATIM]');
+    expect(prompt).toContain('This is source content.');
+    expect(prompt).toContain('cite with [n] notation');
+  });
+
+  it('should format multiple sources correctly', () => {
+    const sources = [
+      {
+        index: 1,
+        title: 'First Source',
+        domain: 'first.com',
+        content: 'First content.',
+        isVerbatim: true,
+      },
+      {
+        index: 2,
+        title: 'Second Source',
+        domain: 'second.com',
+        content: 'Second content.',
+        isVerbatim: false,
+      },
+    ];
+
+    const prompt = createAISuggestionPrompt(sampleContent, defaultUserPrompt, sources);
+
+    expect(prompt).toContain('[Source 1] First Source (first.com) [VERBATIM]');
+    expect(prompt).toContain('[Source 2] Second Source (second.com) [SUMMARIZED]');
+    expect(prompt).toContain('First content.');
+    expect(prompt).toContain('Second content.');
+  });
+
+  it('should handle empty sources array', () => {
+    const prompt = createAISuggestionPrompt(sampleContent, defaultUserPrompt, []);
+
+    expect(prompt).toContain(sampleContent);
+    expect(prompt).not.toContain('Reference Sources');
+  });
+
+  it('should add citation instruction to rules when sources provided', () => {
+    const sources = [
+      {
+        index: 1,
+        title: 'Source',
+        domain: 'example.com',
+        content: 'Content.',
+        isVerbatim: true,
+      },
+    ];
+
+    const prompt = createAISuggestionPrompt(sampleContent, defaultUserPrompt, sources);
+
+    expect(prompt).toContain('When using information from sources, cite with [n] notation');
+  });
+
+  it('should not add citation instruction when no sources', () => {
+    const prompt = createAISuggestionPrompt(sampleContent, defaultUserPrompt);
+
+    expect(prompt).not.toContain('When using information from sources');
+  });
+});
+
+describe('formatSourcesForPrompt - Source Conversion', () => {
+  // Get the mock
+  const mockGetOrCreateCachedSource = jest.requireMock('@/lib/services/sourceCache').getOrCreateCachedSource;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('should convert successful source chips to prompt format', async () => {
+    const sources: SourceChipType[] = [
+      {
+        url: 'https://example.com/article',
+        title: 'Example Article',
+        favicon_url: null,
+        domain: 'example.com',
+        status: 'success',
+        error_message: null,
+      },
+    ];
+
+    mockGetOrCreateCachedSource.mockResolvedValueOnce({
+      source: {
+        id: 1,
+        url: 'https://example.com/article',
+        url_hash: 'abc123',
+        title: 'Example Article',
+        extracted_text: 'This is the article content.',
+        is_summarized: false,
+        fetched_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      },
+      isFromCache: true,
+      error: null,
+    });
+
+    const result = await formatSourcesForPrompt(sources, 'test-user');
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      index: 1,
+      title: 'Example Article',
+      domain: 'example.com',
+      content: 'This is the article content.',
+      isVerbatim: true,
+    });
+  });
+
+  it('should skip sources with non-success status', async () => {
+    const sources: SourceChipType[] = [
+      {
+        url: 'https://loading.com',
+        title: null,
+        favicon_url: null,
+        domain: 'loading.com',
+        status: 'loading',
+        error_message: null,
+      },
+      {
+        url: 'https://failed.com',
+        title: null,
+        favicon_url: null,
+        domain: 'failed.com',
+        status: 'failed',
+        error_message: 'Failed to fetch',
+      },
+    ];
+
+    const result = await formatSourcesForPrompt(sources, 'test-user');
+
+    expect(result).toHaveLength(0);
+    expect(mockGetOrCreateCachedSource).not.toHaveBeenCalled();
+  });
+
+  it('should handle fetch errors gracefully', async () => {
+    const sources: SourceChipType[] = [
+      {
+        url: 'https://example.com/article',
+        title: 'Article',
+        favicon_url: null,
+        domain: 'example.com',
+        status: 'success',
+        error_message: null,
+      },
+    ];
+
+    mockGetOrCreateCachedSource.mockRejectedValueOnce(new Error('Network error'));
+
+    // Spy on console.warn
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await formatSourcesForPrompt(sources, 'test-user');
+
+    expect(result).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith('Failed to fetch source for prompt', expect.anything());
+
+    warnSpy.mockRestore();
+  });
+
+  it('should skip sources without extracted text', async () => {
+    const sources: SourceChipType[] = [
+      {
+        url: 'https://example.com/article',
+        title: 'Article',
+        favicon_url: null,
+        domain: 'example.com',
+        status: 'success',
+        error_message: null,
+      },
+    ];
+
+    mockGetOrCreateCachedSource.mockResolvedValueOnce({
+      source: {
+        id: 1,
+        url: 'https://example.com/article',
+        url_hash: 'abc123',
+        title: 'Article',
+        extracted_text: null, // No extracted text
+        is_summarized: false,
+        fetched_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      },
+      isFromCache: true,
+      error: null,
+    });
+
+    const result = await formatSourcesForPrompt(sources, 'test-user');
+
+    expect(result).toHaveLength(0);
+  });
+
+  it('should set isVerbatim based on is_summarized flag', async () => {
+    const sources: SourceChipType[] = [
+      {
+        url: 'https://example.com/article',
+        title: 'Article',
+        favicon_url: null,
+        domain: 'example.com',
+        status: 'success',
+        error_message: null,
+      },
+    ];
+
+    mockGetOrCreateCachedSource.mockResolvedValueOnce({
+      source: {
+        id: 1,
+        url: 'https://example.com/article',
+        url_hash: 'abc123',
+        title: 'Article',
+        extracted_text: 'Summarized content.',
+        is_summarized: true, // Summarized
+        fetched_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      },
+      isFromCache: true,
+      error: null,
+    });
+
+    const result = await formatSourcesForPrompt(sources, 'test-user');
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.isVerbatim).toBe(false); // is_summarized=true means isVerbatim=false
+  });
+
+  it('should use domain as title fallback', async () => {
+    const sources: SourceChipType[] = [
+      {
+        url: 'https://example.com/article',
+        title: null,
+        favicon_url: null,
+        domain: 'example.com',
+        status: 'success',
+        error_message: null,
+      },
+    ];
+
+    mockGetOrCreateCachedSource.mockResolvedValueOnce({
+      source: {
+        id: 1,
+        url: 'https://example.com/article',
+        url_hash: 'abc123',
+        title: null, // No title in cache
+        extracted_text: 'Content.',
+        is_summarized: false,
+        fetched_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      },
+      isFromCache: true,
+      error: null,
+    });
+
+    const result = await formatSourcesForPrompt(sources, 'test-user');
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.title).toBe('example.com');
+  });
+});
+
+// ============= Integration-Style Tests =============
+
+describe('aiSuggestion - Workflow Simulation', () => {
+  const defaultUserPrompt = 'Improve the content';
+
+  it('should complete full validation workflow', () => {
+    // 1. Create prompt
+    const content = 'Original content here';
+    const prompt = createAISuggestionPrompt(content, defaultUserPrompt);
+    expect(prompt).toContain(content);
+
+    // 2. Simulate AI response
+    const aiResponse = JSON.stringify({
+      edits: ['Improved content', '... existing text ...', 'Enhanced ending'],
+    });
+
+    // 3. Validate response
+    const validation = validateAISuggestionOutput(aiResponse);
+    expect(validation.success).toBe(true);
+
+    // 4. Merge output
+    if (validation.success) {
+      const merged = mergeAISuggestionOutput(validation.data);
+      expect(merged).toContain('Improved content');
+      expect(merged).toContain('Enhanced ending');
+    }
+  });
+
+  it('should handle validation failure gracefully', () => {
+    const invalidResponse = JSON.stringify({
+      edits: ['... existing text ...', 'Content'],
+    });
+
+    const validation = validateAISuggestionOutput(invalidResponse);
+    expect(validation.success).toBe(false);
+
+    if (!validation.success) {
+      expect(validation.error).toBeDefined();
+      expect(validation.error.issues).toBeDefined();
+    }
+  });
+
+  it('should create apply edits prompt from validated output', () => {
+    const validJSON = JSON.stringify({
+      edits: ['New intro', '... existing text ...'],
+    });
+
+    const validation = validateAISuggestionOutput(validJSON);
+    expect(validation.success).toBe(true);
+
+    if (validation.success) {
+      const merged = mergeAISuggestionOutput(validation.data);
+      const applyPrompt = createApplyEditsPrompt(merged, 'Original content');
+
+      expect(applyPrompt).toContain('New intro');
+      expect(applyPrompt).toContain('Original content');
+    }
+  });
+});
