@@ -1,6 +1,6 @@
 # ExplainAnything
 
-This project explores how to use AI to produce high-quality educational content at scale, by generating LLM-based content and having users provide feedback. Each page covers a specific topic (like a Wiki), and clicking links generates new related articles. 
+This project explores how to use AI to produce high-quality educational content at scale, by generating LLM-based explanations and ranking them based on user feedback. Each page covers a specific topic (like a Wiki), and clicking links generates new related articles. 
 
 Features include:
 - LLM-based content generation
